@@ -34,6 +34,7 @@ Las credenciales RTSP viven **sólo** en `/etc/go2rtc/go2rtc.yaml` dentro del LX
 DVRStream/
 ├── README.md
 ├── PLAN-visor-camaras.md
+├── VERIFICACION-MANUAL.md     checklist de hardware real (LXC + DVR)
 ├── frontend/                  proyecto Angular
 └── deploy/
     ├── go2rtc.example.yaml    muestra de referencia (el script genera el real)
@@ -168,6 +169,8 @@ a `/opt/visor-camaras/www/`. Los estáticos se leen de disco en cada request, as
 que **no hace falta reiniciar go2rtc**.
 
 A partir de ahí, `http://IP_LXC:1984/` sirve la app Angular en vez de la UI de go2rtc.
+Para cerrar el despliegue, corré el checklist de hardware real:
+[`VERIFICACION-MANUAL.md`](./VERIFICACION-MANUAL.md).
 
 ### 5. Desarrollo local del front
 
@@ -179,8 +182,15 @@ npm start
 
 `ng serve` usa `proxy.conf.json` para redirigir `/api` (incluido WebSocket) a
 `http://IP_LXC:1984`, así en desarrollo también se trabaja "mismo origen".
-Ajustar la IP del LXC **sólo** en `proxy.conf.json`: es el único archivo que
-contiene el placeholder `IP_LXC`.
+**Reemplazá el placeholder `IP_LXC` por la IP real del LXC en `proxy.conf.json`**:
+es el **único** archivo del proyecto que lo contiene.
+
+Tests automáticos (vitest, sin navegador) y gate de build:
+
+```bash
+npx ng test --watch=false        # suite completa
+npx ng build --configuration production
+```
 
 > **Desviación del plan (§4.3): base URL de desarrollo.**
 > `PLAN-visor-camaras.md` §4.3 pide `environment.development.ts` con
@@ -190,6 +200,69 @@ contiene el placeholder `IP_LXC`.
 > que el video no conectaría; además el proxy quedaría sin uso. Con `''`,
 > desarrollo y producción comparten la misma topología (mismo origen) y el
 > placeholder `IP_LXC` vive en un solo archivo.
+
+---
+
+## Uso del visor
+
+### Grilla y vista individual
+
+- La grilla (`/`) muestra las 4 cámaras en 2x2; cada celda tiene el nombre abajo y,
+  al pasar el mouse (o **siempre**, en dispositivos táctiles), **Ampliar**,
+  **Snapshot** y **Renombrar**.
+- **Ampliar** abre la vista individual; también se llega con doble click en la celda
+  (en equipos con mouse), con las teclas `1`–`4`, o directo a `/#/cam/cam2`.
+- **Reordenar**: sólo se arrastra **desde el grip** (el botón de seis puntos, arriba a
+  la derecha de cada celda). Un swipe/arrastre sobre el cuerpo de la celda no reordena.
+- **Restablecer** (arriba de la grilla) vuelve a los nombres y el orden por defecto, y
+  pide confirmación antes.
+
+### Atajos de teclado
+
+| Vista | Tecla | Acción |
+|---|---|---|
+| Grilla | `1`–`4` | abre la cámara que está en esa posición |
+| Vista individual | `Esc` o `Backspace` | vuelve a la grilla |
+| Vista individual | `1`–`4` | salta a la cámara que está en esa posición |
+| Vista individual | `F` | entra/sale de pantalla completa |
+
+Los atajos se ignoran mientras estás escribiendo en el editor de nombre.
+
+### Touch / celular
+
+- En dispositivos **sin hover** los botones están siempre visibles: no hay que
+  "tocar para revelar". **Ampliar** es el camino táctil explícito (no hace falta
+  doble toque).
+- El reordenamiento empieza **sólo** desde el grip; un swipe vertical normal scrollea.
+- Todos los controles miden **≥ 44×44 CSS px** y no se superponen. Abajo de 700 px la
+  grilla pasa a una columna con scroll vertical, sin scroll horizontal ni a 320 px.
+- Si el navegador no soporta pantalla completa para la vista (p. ej. iOS Safari), el
+  botón queda **deshabilitado con una explicación**; **Volver a la grilla** y
+  **Snapshot** siguen funcionando.
+- La reproducción arranca **muda y sin gesto previo** (sin audio en ningún caso).
+
+### Snapshot
+
+- Captura a la **resolución nativa** del video, JPEG calidad 0.92.
+- Nombre del archivo: `{nombre}_{AAAA-MM-DD_HH-mm-ss}.jpg`, con acentos y caracteres
+  inseguros normalizados (ej. `Porton_2026-09-15_21-30-00.jpg`).
+- Funciona desde la grilla y desde la vista individual; el toast confirma
+  "Captura guardada". Si la cámara todavía no tiene frames: "La cámara todavía no está
+  lista" y no descarga nada.
+
+### Dónde vive cada cosa
+
+- **Nombres y orden**: `localStorage` del navegador, clave `visor-camaras.config.v1`.
+  Es **por dispositivo**: cada navegador guarda su propio orden y sus nombres.
+- **Credenciales RTSP**: sólo en `/etc/go2rtc/go2rtc.yaml` dentro del LXC (`0600`,
+  dueño `go2rtc`); nunca en el repo ni en el navegador. Rotarlas = volver a correr
+  el provisioner (paso 2).
+
+### Verificación manual en hardware real
+
+Latencia, WebRTC/MSE, backoff al cortar el DVR, touch, fullscreen real, snapshot
+nativo, rotación de credenciales y control de acceso **no se pueden automatizar**:
+tienen su propio checklist en [`VERIFICACION-MANUAL.md`](./VERIFICACION-MANUAL.md).
 
 ---
 
@@ -209,11 +282,11 @@ Los archivos corresponden **exactamente** a la versión:
 | `frontend/public/go2rtc/video-stream.js` | **v1.9.14** | `AlexxIT/go2rtc` tag `v1.9.14`, `www/video-stream.js` |
 
 `frontend/public/go2rtc/VERSION.txt` guarda el tag y los hashes `sha256`.
-**Mantener estos archivos en sincronía** con la versión de go2rtc instalada en el LXC.
-
-Prueba manual: crear `frontend/src/app/app.routes.ts` con una ruta que renderice
-`<app-camera-player [cameraId]="'cam1'" />` (la Fase 4 agrega las rutas definitivas)
-y abrir `http://localhost:4200/` con `npm start`.
+**Mantener estos archivos en sincronía** con la versión de go2rtc instalada en el LXC:
+el provisioner instala la última release, así que si el LXC no es `v1.9.14`, re-copiá
+`video-rtc.js` y `video-stream.js` desde el tag instalado y actualizá `VERSION.txt`.
+La versión instalada aparece en los primeros renglones del log del servicio
+(`journalctl -u go2rtc -n 20 --no-pager`).
 
 ---
 
@@ -267,6 +340,11 @@ un reverse proxy con autenticación (fuera del alcance de este proyecto).
 **Cambié el front pero sigo viendo el viejo**
 
 - Recarga forzada (`Ctrl+Shift+R`). El navegador cachea los assets.
+
+**"Pantalla completa" aparece deshabilitada**
+
+- Ese navegador no expone fullscreen para la vista (típicamente iOS Safari). No es un
+  error: **Volver a la grilla** y **Snapshot** siguen funcionando.
 
 ---
 
