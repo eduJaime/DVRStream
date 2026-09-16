@@ -13,6 +13,52 @@ import type { MockInstance } from 'vitest';
 import { cameraIdGuard, routes } from './app.routes';
 import { CameraPlayerComponent } from './components/camera-player/camera-player';
 
+/**
+ * Minimal stand-in for the vendored `<video-stream>` element (same pattern as
+ * `grid-view.spec.ts`). With a live element registered, teardown actually
+ * removes a stream: without it `teardownPlayer()` returns before touching
+ * anything and the assertions below prove nothing (finding W4).
+ */
+class FakeVideoStreamElement extends HTMLElement {
+  mode = '';
+  media = '';
+  src = '';
+  background = false;
+  visibilityCheck = true;
+  reconnectTID = 0;
+  disconnectTID = 0;
+  video: HTMLVideoElement | null = null;
+  onmessage: Record<string, (msg: { type: string; value?: unknown }) => void> | null = null;
+
+  disconnectCalls = 0;
+
+  onconnect(): boolean {
+    return true;
+  }
+
+  onopen(): string[] {
+    this.onmessage = { stream: () => undefined };
+    return ['webrtc'];
+  }
+
+  override onclose = (): boolean => true;
+
+  ondisconnect(): void {
+    this.disconnectCalls += 1;
+  }
+
+  connectedCallback(): void {
+    if (!this.video) {
+      this.video = document.createElement('video');
+      this.appendChild(this.video);
+    }
+  }
+}
+
+if (!customElements.get('video-stream')) {
+  customElements.define('video-stream', FakeVideoStreamElement);
+}
+
 /** Runtime access to the player's teardown path (private at the type level). */
 interface PlayerInternals {
   stopConnection(): void;
@@ -77,8 +123,17 @@ describe('app routes', () => {
 
   it('closes the grid streams when the single view opens, and its own when going back (D2)', async () => {
     const harness = await RouterTestingHarness.create('/');
+    await harness.fixture.whenStable();
+    const gridHost = harness.routeNativeElement as HTMLElement;
     const gridPlayers = players(harness);
     expect(gridPlayers).toHaveLength(4);
+
+    // Precondition: every grid player holds a live element. Only then does the
+    // teardown below prove a real stream was closed (finding W4).
+    const gridElements = Array.from(
+      gridHost.querySelectorAll('video-stream'),
+    ) as FakeVideoStreamElement[];
+    expect(gridElements).toHaveLength(4);
 
     const gridStops = gridPlayers.map(spyOnTeardown);
 
@@ -87,8 +142,15 @@ describe('app routes', () => {
     // The route swap destroyed the grid, so its four streams are closed by
     // teardown — not left open behind the single view.
     gridStops.forEach((stop) => expect(stop).toHaveBeenCalledTimes(1));
+    gridElements.forEach((element) => {
+      expect(element.disconnectCalls).toBeGreaterThan(0);
+      expect(element.isConnected).toBe(false);
+    });
     expect(players(harness)).toHaveLength(1);
 
+    const singleHost = harness.routeNativeElement as HTMLElement;
+    const singleElement = singleHost.querySelector('video-stream') as FakeVideoStreamElement | null;
+    expect(singleElement).not.toBeNull();
     const singleStop = spyOnTeardown(players(harness)[0]);
 
     await harness.navigateByUrl('/');
@@ -96,23 +158,35 @@ describe('app routes', () => {
     // Leaving the single view closed its stream too; the grid was rebuilt
     // with fresh players (none of the original instances survived).
     expect(singleStop).toHaveBeenCalledTimes(1);
+    expect(singleElement!.disconnectCalls).toBeGreaterThan(0);
+    expect(singleElement!.isConnected).toBe(false);
     expect(players(harness)).toHaveLength(4);
     players(harness).forEach((player) => expect(gridPlayers).not.toContain(player));
   });
 
   it('switches cameras inside the single view without recreating the player', async () => {
     const harness = await RouterTestingHarness.create('/cam/cam2');
+    await harness.fixture.whenStable();
     const player = players(harness)[0];
-    // Same per-instance teardown spy as the D2 test: a prototype spy on
-    // `ngOnDestroy` cannot intercept a lifecycle hook.
     const stop = spyOnTeardown(player);
+    const firstElement = (harness.routeNativeElement as HTMLElement).querySelector(
+      'video-stream',
+    ) as FakeVideoStreamElement | null;
+    expect(firstElement).not.toBeNull();
 
     await harness.navigateByUrl('/cam/cam4');
 
+    // The component instance survives the param change...
     expect(players(harness)).toEqual([player]);
     expect(player.cameraId).toBe('cam4');
-    // The player survives the switch, so its stream is never torn down.
-    expect(stop).not.toHaveBeenCalled();
+    // ...and its old stream is closed: that socket belonged to cam2.
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(firstElement!.isConnected).toBe(false);
+
+    await harness.fixture.whenStable();
+    expect(
+      (harness.routeNativeElement as HTMLElement).querySelector('video-stream'),
+    ).not.toBeNull();
   });
 
   it('allows a configured camera id and redirects an unknown one (guard)', () => {
