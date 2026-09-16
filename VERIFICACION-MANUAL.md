@@ -28,7 +28,7 @@
 | 5 | Reordenar no reconecta (sin cuadro negro) y persiste | Camera ordering |
 | 6 | Snapshot a resolución nativa, nombre correcto y JPG que abre | Native-resolution snapshot |
 | 7 | Touch: sin hover, grip vs swipe, 44×44, 320 px, fullscreen degradado | touch-mobile |
-| 8 | Rotación de credenciales re-corriendo el provisioner + rollback `.prev` | lxc-provisioning |
+| 8 | Provisioner: rotación + rollback, escritura interrumpida, fallo de servicio, secretos y run desatendido | lxc-provisioning |
 | 9 | Despliegue y control de acceso (LAN sí, fuera de la subred no; reboot del LXC) | Fase 7 del plan |
 
 ## 1. Reproducción de las 4 cámaras, latencia y protocolo
@@ -117,7 +117,8 @@
 - [ ] **Ampliar** abre la vista individual con un solo toque (no hace falta doble toque).
 - [ ] **Swipe vertical sobre la celda scrollea** la página y **no** inicia un reordenamiento.
 - [ ] Un arrastre que empieza **exactamente en el grip** sí reordena.
-- [ ] Medí con DevTools: **todo control interactivo mide ≥ 44×44 CSS px** y no se superpone.
+- [ ] Medí con DevTools: **todo control interactivo mide ≥ 44×44 CSS px** y no se superpone,
+      incluido el botón **Reintentar** del estado "Sin señal" (sección 2).
 - [ ] A **320 px** de ancho (y 360/390/414) la grilla es de una columna, con scroll
       vertical y **sin scroll horizontal**.
 - [ ] **Pantalla completa degradada**: en un navegador sin fullscreen para la vista
@@ -127,17 +128,75 @@
 - [ ] El video arranca **mudo, sin gesto previo** y sin controles de audio.
 - [ ] El editor de nombre es usable: Guardar/Cancelar alcanzables y el zoom no salta al enfocar.
 
-## 8. Rotación de credenciales con el provisioner
+## 8. Provisioner: rotación, atomicidad, secretos y run desatendido
+
+### 8.1 Rotación de credenciales + rollback (spec: Idempotent and atomic re-runs)
 
 1. Re-corré el provisioner en el LXC (con datos nuevos o una ruta de canal distinta):
    `ssh -t root@IP_LXC 'bash /root/deploy/install-lxc.sh'` (o con flags/`--password-file`).
 
-- [ ] El script valida, escribe **atómicamente**, reinicia y reporta éxito.
+- [ ] El script valida, escribe **atómicamente**, reinicia y reporta éxito (exit 0).
 - [ ] `/etc/go2rtc/go2rtc.yaml` queda `0600` y dueño `go2rtc:go2rtc`.
 - [ ] Existe `/etc/go2rtc/go2rtc.yaml.prev` con la config anterior (`0600`).
 - [ ] Las cámaras vuelven a andar después del restart.
 - [ ] **Rollback probado**: `cp /etc/go2rtc/go2rtc.yaml.prev /etc/go2rtc/go2rtc.yaml && systemctl restart go2rtc`
       deja funcionando las credenciales anteriores.
+
+### 8.2 Escritura interrumpida: SIGKILL entre render y rename (spec: Interrupted write)
+
+La ventana entre el render (fase 6) y el `mv` atómico (fase 7) es corta; se ensancha
+matando el proceso repetidas veces en momentos distintos:
+
+1. Anotá la config viva: `sha256sum /etc/go2rtc/go2rtc.yaml`.
+2. Re-corré el provisioner con datos nuevos y matalo a lo bruto a mitad de camino
+   (`kill -9 <pid>`), variando el momento entre corridas (p. ej. `timeout -s KILL 1.5 bash install-lxc.sh …`).
+3. Repetilo 3–5 veces y después de **cada** kill verificá la config viva.
+
+- [ ] `go2rtc.yaml` sigue existiendo, completo (`grep -cE '^  cam[1-4]:' /etc/go2rtc/go2rtc.yaml` = 4) y en `0600`.
+- [ ] Su contenido es **la config vieja completa o la nueva completa**, nunca una mezcla ni un archivo truncado.
+- [ ] `go2rtc` sigue sirviendo las cámaras (la config viva nunca desapareció).
+- [ ] Tras `SIGKILL` puede quedar un temporal `.go2rtc.yaml.XXXXXX` (el trap no corre en `SIGKILL`):
+      es esperable, se borra a mano y **no** afecta la config viva.
+
+### 8.3 Reporte real de fallo del servicio (spec: Verification and reporting)
+
+1. Forzá un arranque fallido y re-corré el provisioner con datos válidos:
+   ```bash
+   printf '#!/bin/sh\nexit 1\n' > /usr/local/bin/go2rtc && chmod 0755 /usr/local/bin/go2rtc
+   ssh -t root@IP_LXC 'bash /root/deploy/install-lxc.sh'   # o --yes + flags + --password-file
+   ```
+2. Restaurá el binario real: `ssh -t root@IP_LXC 'bash /root/deploy/install-lxc.sh --upgrade'` (re-descarga vía `--upgrade`).
+
+- [ ] La corrida termina con **exit 1** (no 0) y reporta el fallo explícitamente.
+- [ ] Imprime los dos comandos exactos: `journalctl -u go2rtc -n 50 --no-pager` y el rollback con `.prev`.
+- [ ] Con el binario restaurado, un nuevo re-run deja el servicio activo (exit 0).
+
+### 8.4 Contraseña oculta: sin eco y sin historial (spec: Secret handling)
+
+Se prueba sin root y sin tocar la config usando `--dry-run`:
+
+1. `bash deploy/install-lxc.sh --dry-run` en una terminal real; en `Contraseña del DVR:`
+   tipeá un **canario** (p. ej. `canario-sin-eco-123`) y respondé `n` en `¿Aplicar?`
+   (aborta con exit 130 y no escribe nada).
+2. Revisá el terminal y el historial.
+
+- [ ] Mientras se tipea, la contraseña **no se ve** (sin eco).
+- [ ] El canario no aparece en la salida (el resumen muestra `********`).
+- [ ] `history | grep canario` y `grep canario ~/.bash_history` no lo encuentran.
+- [ ] `DVR_PASSWORD=...` por entorno se avisa y se ignora (el valor no se usa).
+
+### 8.5 Run realmente desatendido con `--password-file` (spec: Non-interactive escape hatch)
+
+1. Prepará el archivo: `printf '%s\n' "$PASSWORD" > /root/dvr.pw && chmod 600 /root/dvr.pw`.
+2. Corré **sin TTY** (sin `-t`) y con todos los valores por flags:
+   ```bash
+   ssh root@IP_LXC 'bash /root/deploy/install-lxc.sh --yes \
+     --address IP_LXC --dvr-host IP_DVR --dvr-user USUARIO --password-file /root/dvr.pw'
+   ```
+
+- [ ] No aparece **ningún** prompt ni la corrida se bloquea esperando entrada.
+- [ ] Termina con exit 0, `go2rtc` queda activo y la UI responde.
+- [ ] La contraseña no aparece en la salida ni en `ps -ef` durante la corrida.
 
 ## 9. Despliegue y control de acceso
 
