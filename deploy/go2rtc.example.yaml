@@ -1,0 +1,44 @@
+# go2rtc.example.yaml -- MUESTRA DE REFERENCIA. NO se copia tal cual.
+#
+# El archivo real (/etc/go2rtc/go2rtc.yaml) lo genera deploy/install-lxc.sh a
+# partir de los prompts o de los flags: no hay que editar nada a mano. Este
+# ejemplo queda sólo como referencia del formato y de las claves que escribe
+# el provisioner.
+#
+# Los valores reales viven únicamente en el LXC (0600, dueño go2rtc) y nunca se
+# commitean al repo.
+#
+# SEGURIDAD: la API de go2rtc puede exponer las URLs de origen (con credenciales).
+# Por eso el puerto 1984 sólo debe ser accesible desde la LAN.
+
+api:
+  listen: ":1984"                        # HTTP: API + front Angular ("" = desactivado)
+  static_dir: "/opt/visor-camaras/www"   # build de Angular servido en la raíz "/"
+
+rtsp:
+  listen: ""                             # sin servidor RTSP: no hace falta re-exponer
+
+webrtc:
+  listen: ":8555"                        # TCP+UDP para el tráfico WebRTC
+  candidates:
+    # El provisioner escribe acá la IP publicada del LXC (detectada o --address).
+    # Si esta IP no coincide con la real, el video WebRTC queda en negro.
+    - IP_LXC:8555
+
+streams:
+  # Los IDs cam1..cam4 son FIJOS: el front usa exactamente estos nombres.
+  #
+  # Rutas del DVR (patrón Hikvision, default del provisioner):
+  #   /Streaming/Channels/<canal><stream>
+  #   101 = canal 1 principal, 201 = canal 2, 301 = canal 3, 401 = canal 4.
+  #   102/202/302/402 serian los substreams, que este DVR no usa.
+  #
+  # El provisioner percent-encodea usuario y contraseña (RFC 3986) al componer
+  # la URL, así que los caracteres especiales (@ : / # ? & %) no la rompen.
+  cam1: rtsp://USUARIO:PASSWORD@IP_DVR:554/Streaming/Channels/101
+  cam2: rtsp://USUARIO:PASSWORD@IP_DVR:554/Streaming/Channels/201
+  cam3: rtsp://USUARIO:PASSWORD@IP_DVR:554/Streaming/Channels/301
+  cam4: rtsp://USUARIO:PASSWORD@IP_DVR:554/Streaming/Channels/401
+
+log:
+  level: info

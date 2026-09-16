@@ -1,0 +1,24 @@
+# Unidad systemd para go2rtc -- instalada por deploy/install-lxc.sh
+# Ruta final: /etc/systemd/system/go2rtc.service
+[Unit]
+Description=go2rtc - puente RTSP a WebRTC/MSE (visor de camaras)
+Documentation=https://github.com/AlexxIT/go2rtc
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=go2rtc
+Group=go2rtc
+ExecStart=/usr/local/bin/go2rtc -config /etc/go2rtc/go2rtc.yaml
+Restart=always
+RestartSec=5
+
+# Endurecimiento mínimo. Se deja deliberadamente conservador para no romper
+# WebRTC (que necesita abrir puertos efímeros). No agregar ProtectSystem=strict
+# sin volver a probar la reproducción de las 4 cámaras.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
