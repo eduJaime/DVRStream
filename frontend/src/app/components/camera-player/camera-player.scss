@@ -51,6 +51,13 @@
 .overlay__retry {
   pointer-events: auto;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* WCAG 2.5.5 target floor, same floor as every other control (D28). The
+     rendered size is a manual gate: jsdom has no layout engine (finding C3). */
+  min-width: 44px;
+  min-height: 44px;
   border: 1px solid rgba(255, 255, 255, 0.6);
   border-radius: 4px;
   padding: 0.4rem 0.9rem;
