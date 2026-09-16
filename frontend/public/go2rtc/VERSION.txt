@@ -1,0 +1,12 @@
+go2rtc v1.9.14
+https://github.com/AlexxIT/go2rtc/releases/tag/v1.9.14
+
+Files in this directory were downloaded verbatim from that exact tag:
+- www/video-rtc.js
+- www/video-stream.js
+
+sha256:
+d48ce627baf7c341a92c0f5844a3c546431f9db873ff21489671aba2ecfe64fb  video-rtc.js
+86b4b69001242c3c71f9aedceabff06a6bc58155d8a0fe27970834aefc670b16  video-stream.js
+
+Keep these files in sync with the go2rtc version installed in the LXC.

@@ -1,0 +1,8 @@
+{
+  "/api": {
+    "target": "http://IP_LXC:1984",
+    "secure": false,
+    "changeOrigin": true,
+    "ws": true
+  }
+}

@@ -1,0 +1,12 @@
+<div class="stage" #stage></div>
+
+@if (status() === 'connecting') {
+  <div class="overlay overlay--connecting" role="status" aria-live="polite">Conectando…</div>
+}
+
+@if (status() === 'error') {
+  <div class="overlay overlay--error" role="alert">
+    <span class="overlay__message">Sin señal</span>
+    <button class="overlay__retry" type="button" (click)="retry()">Reintentar</button>
+  </div>
+}
