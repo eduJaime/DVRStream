@@ -213,6 +213,38 @@ describe('CameraPlayerComponent', () => {
     expect(player()).toBe(second);
   });
 
+  it('ignores a late playing event from a player torn down by a signal loss', async () => {
+    const lost = await mountPlayer();
+
+    // The signal drops: the element is detached and the 5s retry is pending.
+    lost.video!.dispatchEvent(new Event('error'));
+    fixture.detectChanges();
+    expect(fixture.componentInstance.status()).toBe('error');
+
+    // The detached <video> can still fire `playing` after teardown; it must not
+    // fake a live status while "Sin señal" is showing.
+    lost.video!.dispatchEvent(new Event('playing'));
+    fixture.detectChanges();
+
+    expect(fixture.componentInstance.status()).toBe('error');
+    expect(liveElement()).toBeNull();
+    const overlay = fixture.nativeElement.querySelector('.overlay--error') as HTMLElement | null;
+    expect(overlay).not.toBeNull();
+    expect(overlay!.textContent).toContain('Sin señal');
+  });
+
+  it('ignores a late playing event from a replaced player', async () => {
+    const first = await mountPlayer();
+    const second = await replaceCamera('cam2');
+    expect(second).not.toBe(first);
+
+    first.video!.dispatchEvent(new Event('playing'));
+    fixture.detectChanges();
+
+    expect(fixture.componentInstance.status()).toBe('connecting');
+    expect(player()).toBe(second);
+  });
+
   describe('silent playback (R: Silent playback)', () => {
     it('configures the stream element and its <video> for silent autoplay', async () => {
       const el = await mountPlayer();

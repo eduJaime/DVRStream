@@ -86,7 +86,6 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
   private retryTID: number | null = null;
   private connectTimeoutTID: number | null = null;
 
-  private readonly onVideoPlaying = (): void => this.onPlaying();
   private readonly onVideoError = (): void => this.onConnectionLost();
 
   constructor() {
@@ -306,7 +305,7 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
     video.style.width = '100%';
     video.style.height = '100%';
 
-    video.addEventListener('playing', this.onVideoPlaying);
+    video.addEventListener('playing', () => this.onPlaying(el));
     video.addEventListener('error', this.onVideoError);
   }
 
@@ -321,8 +320,11 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
     };
   }
 
-  private onPlaying(): void {
-    if (!this.canRun()) return;
+  private onPlaying(el: VideoStreamElement): void {
+    // Same stale-element policy as the wrapped go2rtc hooks: a late `playing`
+    // from a detached <video> must not fake a live status after teardown.
+    if (this.playerEl !== el || !this.canRun()) return;
+
     this.retryAttempt = 0;
     this.clearConnectTimeout();
     this.setStatus('playing');
