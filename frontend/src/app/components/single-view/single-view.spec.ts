@@ -202,11 +202,15 @@ describe('SingleViewComponent', () => {
     expect(harness.cameraName()).toBe('Cámara 2');
   });
 
-  it('renders Volver a la grilla, Pantalla completa and Snapshot as 44px toolbar controls', async () => {
+  it('renders Volver a la grilla, Pantalla completa and Snapshot as real toolbar buttons', async () => {
     await setup({});
 
     ['Volver a la grilla', 'Pantalla completa', 'Snapshot'].forEach((label) => {
       const button = harness.button(label);
+      expect(button.tagName).toBe('BUTTON');
+      expect(button.type).toBe('button');
+      // The shared class carries the 44px floor; the rendered box itself is a
+      // manual gate (jsdom has no layout engine) — see VERIFICACION-MANUAL.md §7.
       expect(button.classList.contains('toolbar-btn')).toBe(true);
     });
   });

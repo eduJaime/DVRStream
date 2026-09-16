@@ -93,4 +93,27 @@ describe('CameraConfigService', () => {
     const service = new CameraConfigService();
     expect(service.config()).toEqual(DEFAULTS);
   });
+
+  it('pins the persisted storage key literal (spec: Camera naming)', () => {
+    // The spec names the key; asserting through the exported constant alone
+    // would pass for any value (finding W2).
+    expect(CAMERA_CONFIG_STORAGE_KEY).toBe('visor-camaras.config.v1');
+  });
+
+  it('reads and writes the config through the pinned literal key', () => {
+    const stored = DEFAULTS.map((camera) =>
+      camera.id === 'cam1' ? { ...camera, name: 'Portón' } : camera,
+    );
+    localStorage.setItem('visor-camaras.config.v1', JSON.stringify(stored));
+
+    const seeded = new CameraConfigService();
+    expect(seeded.config().find((camera) => camera.id === 'cam1')?.name).toBe('Portón');
+
+    seeded.rename('cam2', 'Patio');
+    const raw = localStorage.getItem('visor-camaras.config.v1');
+    expect(raw).not.toBeNull();
+    expect(JSON.parse(raw!).find((camera: { id: string }) => camera.id === 'cam2')?.name).toBe(
+      'Patio',
+    );
+  });
 });
