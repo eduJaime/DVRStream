@@ -78,6 +78,18 @@ describe('CameraPlayerComponent', () => {
     return el as FakeVideoStreamElement;
   }
 
+  /** The live player element, or null while the stream is torn down. */
+  function liveElement(): FakeVideoStreamElement | null {
+    return stage().querySelector('video-stream');
+  }
+
+  /** Drops the live stream the way the browser does: an error on its `<video>`. */
+  function loseSignal(): void {
+    const el = liveElement();
+    expect(el, 'live player element before the connection loss').not.toBeNull();
+    el!.video!.dispatchEvent(new Event('error'));
+  }
+
   async function mountPlayer(): Promise<FakeVideoStreamElement> {
     fixture.detectChanges();
     await fixture.whenStable();
@@ -104,6 +116,7 @@ describe('CameraPlayerComponent', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     for (const extra of extraFixtures) extra.destroy();
     fixture.destroy();
     vi.restoreAllMocks();
@@ -198,5 +211,158 @@ describe('CameraPlayerComponent', () => {
     expect(first.connectCalls).toBe(callsWhileAlive);
     expect(fixture.componentInstance.status()).toBe('connecting');
     expect(player()).toBe(second);
+  });
+
+  describe('silent playback (R: Silent playback)', () => {
+    it('configures the stream element and its <video> for silent autoplay', async () => {
+      const el = await mountPlayer();
+
+      expect(el.mode).toBe('webrtc,mse');
+      expect(el.media).toBe('video');
+
+      const video = el.video!;
+      expect(video.muted).toBe(true);
+      expect(video.defaultMuted).toBe(true);
+      expect(video.playsInline).toBe(true);
+      expect(video.autoplay).toBe(true);
+      expect(video.controls).toBe(false);
+    });
+  });
+
+  describe('resilient playback (R: Resilient playback)', () => {
+    it('keeps "Sin señal" and Reintentar visible instead of reconnecting on the next flush', async () => {
+      const lost = await mountPlayer();
+
+      lost.video!.dispatchEvent(new Event('error'));
+
+      // Angular flushes the constructor effect here. On the buggy code that
+      // flush re-entered startConnection() through the `status` read inside
+      // setStatus(), flipping the status back and recreating the element.
+      fixture.detectChanges();
+
+      expect(fixture.componentInstance.status()).toBe('error');
+      const overlay = fixture.nativeElement.querySelector('.overlay--error') as HTMLElement | null;
+      expect(overlay).not.toBeNull();
+      expect(overlay!.textContent).toContain('Sin señal');
+      expect(overlay!.querySelector('.overlay__retry')?.textContent).toContain('Reintentar');
+      expect(liveElement()).toBeNull();
+
+      // The 5s retry timer is pending: nothing may reconnect inside this window.
+      await fixture.whenStable();
+      fixture.detectChanges();
+
+      expect(fixture.componentInstance.status()).toBe('error');
+      expect(liveElement()).toBeNull();
+    });
+
+    it('waits the 5s backoff before the first automatic retry', async () => {
+      const lost = await mountPlayer();
+      vi.useFakeTimers();
+
+      lost.video!.dispatchEvent(new Event('error'));
+      fixture.detectChanges();
+
+      expect(fixture.componentInstance.status()).toBe('error');
+
+      await vi.advanceTimersByTimeAsync(4_999);
+      fixture.detectChanges();
+
+      // Still inside the backoff window: no element has been recreated.
+      expect(fixture.componentInstance.status()).toBe('error');
+      expect(liveElement()).toBeNull();
+
+      await vi.advanceTimersByTimeAsync(1);
+      fixture.detectChanges();
+
+      expect(fixture.componentInstance.status()).toBe('connecting');
+      expect(liveElement()).not.toBeNull();
+    });
+
+    it('retries on the 5s → 10s → 20s → 30s cadence and keeps the 30s cap', async () => {
+      const lost = await mountPlayer();
+      vi.useFakeTimers();
+
+      lost.video!.dispatchEvent(new Event('error'));
+      fixture.detectChanges();
+
+      const attemptTimes: number[] = [];
+      let elapsed = 0;
+
+      // Step in small slices so each retry is observed right when it starts and
+      // can be failed immediately, forcing the next backoff step.
+      while (attemptTimes.length < 5 && elapsed < 120_000) {
+        elapsed += 100;
+        await vi.advanceTimersByTimeAsync(100);
+        fixture.detectChanges();
+
+        const attempt = liveElement();
+        if (!attempt) continue;
+
+        attemptTimes.push(elapsed);
+        loseSignal();
+        fixture.detectChanges();
+      }
+
+      expect(attemptTimes).toEqual([5_000, 15_000, 35_000, 65_000, 95_000]);
+    });
+
+    it('restarts the 5s backoff after a successful recovery', async () => {
+      const lost = await mountPlayer();
+      vi.useFakeTimers();
+
+      lost.video!.dispatchEvent(new Event('error'));
+      fixture.detectChanges();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      fixture.detectChanges();
+      expect(liveElement()).not.toBeNull();
+
+      // The stream comes back on that retry...
+      player().video!.dispatchEvent(new Event('playing'));
+      fixture.detectChanges();
+      expect(fixture.componentInstance.status()).toBe('playing');
+
+      // ...and the next drop waits 5s again: the counter reset on `playing`.
+      player().video!.dispatchEvent(new Event('error'));
+      fixture.detectChanges();
+
+      await vi.advanceTimersByTimeAsync(4_999);
+      fixture.detectChanges();
+      expect(fixture.componentInstance.status()).toBe('error');
+      expect(liveElement()).toBeNull();
+
+      await vi.advanceTimersByTimeAsync(1);
+      fixture.detectChanges();
+      expect(liveElement()).not.toBeNull();
+    });
+
+    it('Reintentar reconnects immediately and the overlay clears once the stream recovers', async () => {
+      const lost = await mountPlayer();
+
+      lost.video!.dispatchEvent(new Event('error'));
+      fixture.detectChanges();
+
+      const overlay = fixture.nativeElement.querySelector('.overlay--error') as HTMLElement;
+      expect(overlay).not.toBeNull();
+      const retry = overlay.querySelector('.overlay__retry') as HTMLButtonElement;
+      expect(retry).not.toBeNull();
+
+      retry.click();
+      fixture.detectChanges();
+      await fixture.whenStable();
+
+      // Manual retry bypasses the backoff and starts a fresh attempt.
+      expect(fixture.componentInstance.status()).toBe('connecting');
+      expect(fixture.nativeElement.querySelector('.overlay--error')).toBeNull();
+      expect(liveElement()).not.toBeNull();
+
+      player().video!.dispatchEvent(new Event('playing'));
+      fixture.detectChanges();
+
+      // Recovery clears the overlay entirely.
+      expect(fixture.componentInstance.status()).toBe('playing');
+      expect(fixture.nativeElement.querySelector('.overlay--connecting')).toBeNull();
+      expect(fixture.nativeElement.querySelector('.overlay--error')).toBeNull();
+    });
   });
 });

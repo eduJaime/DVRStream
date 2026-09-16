@@ -12,6 +12,7 @@ import {
   effect,
   inject,
   signal,
+  untracked,
 } from '@angular/core';
 import { environment } from '../../../environments/environment';
 import { VisibilityService } from '../../services/visibility.service';
@@ -90,11 +91,20 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
 
   constructor() {
     // One shared `visibilitychange` seam for every player (design D4).
+    //
+    // The effect's ONLY reactive input is `tabVisible`. Everything it triggers
+    // (applyConnectionState → startConnection → setStatus, which READS the
+    // `status` signal) must run untracked: otherwise `status` becomes a
+    // dependency, every `setStatus('error')` re-runs the effect, and the effect
+    // immediately reconnects — cancelling the scheduled backoff and turning a
+    // failed stream into a hot reconnect loop (verification finding C1).
     effect(() => {
       const tabVisible = this.visibility.tabVisible();
-      if (!this.initialized) return;
-      if (tabVisible) this.retryAttempt = 0;
-      this.applyConnectionState();
+      untracked(() => {
+        if (!this.initialized) return;
+        if (tabVisible) this.retryAttempt = 0;
+        this.applyConnectionState();
+      });
     });
   }
 
