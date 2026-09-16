@@ -10,6 +10,52 @@ import { CameraPlayerComponent } from '../camera-player/camera-player';
 import { GridViewComponent } from './grid-view';
 
 /**
+ * Minimal stand-in for the vendored `<video-stream>` element (same pattern as
+ * `camera-player.spec.ts`). Registering it lets the players create a live
+ * element: that is the state in which a camera-id change tears the stream down,
+ * so the no-reconnect assertion below exercises the real teardown path.
+ */
+class FakeVideoStreamElement extends HTMLElement {
+  mode = '';
+  media = '';
+  src = '';
+  background = false;
+  visibilityCheck = true;
+  ws: WebSocket | null = null;
+  pc: RTCPeerConnection | null = null;
+  wsState = 0;
+  pcState = 0;
+  reconnectTID = 0;
+  disconnectTID = 0;
+  video: HTMLVideoElement | null = null;
+  onmessage: Record<string, (msg: { type: string; value?: unknown }) => void> | null = null;
+
+  onconnect(): boolean {
+    return true;
+  }
+
+  onopen(): string[] {
+    this.onmessage = { stream: () => undefined };
+    return ['webrtc'];
+  }
+
+  override onclose = (): boolean => true;
+
+  ondisconnect(): void {}
+
+  connectedCallback(): void {
+    if (!this.video) {
+      this.video = document.createElement('video');
+      this.appendChild(this.video);
+    }
+  }
+}
+
+if (!customElements.get('video-stream')) {
+  customElements.define('video-stream', FakeVideoStreamElement);
+}
+
+/**
  * CDK keeps the preview/placeholder templates and the drag handle list private
  * in its typings; the grid tests read them at runtime to lock design D5 (no
  * deep clone of the live tile) and the grip-only drag surface (D24).
@@ -19,6 +65,22 @@ interface DragInternals {
   _placeholderTemplate: { templateRef: TemplateRef<unknown>; data: unknown } | null;
   _viewContainerRef: ViewContainerRef;
   _handles: { getValue(): { element: ElementRef<HTMLElement> }[] };
+}
+
+/** Runtime access to the player's teardown path (private at the type level). */
+interface PlayerInternals {
+  stopConnection(): void;
+}
+
+/**
+ * Observes the exact stream-teardown path of a player: cancel retry, clear the
+ * connect timeout and remove the element (closing its socket). Spied per
+ * instance because Angular binds lifecycle hooks at compile time, so a
+ * prototype spy on `ngOnDestroy` never intercepts them — an assertion built on
+ * one is vacuously true (finding recorded in PR5; reworked here in PR6).
+ */
+function spyOnTeardown(player: CameraPlayerComponent): MockInstance {
+  return vi.spyOn(player as unknown as PlayerInternals, 'stopConnection');
 }
 
 describe('GridViewComponent', () => {
@@ -189,14 +251,28 @@ describe('GridViewComponent', () => {
     expect(cameraNames()).toEqual(['Cámara 4', 'Cámara 1', 'Cámara 2', 'Cámara 3']);
   });
 
-  it('keeps every tile and player instance alive across a reorder (no stream reconnect)', () => {
+  it('keeps every tile and player instance alive across a reorder (no stream reconnect)', async () => {
     fixture.detectChanges();
+    await fixture.whenStable();
+
     const tilesBefore = tileHosts();
     const playersBefore = players();
-    const destroyPlayer = vi.spyOn(CameraPlayerComponent.prototype, 'ngOnDestroy');
+    // Precondition: every player holds a live element, the state in which a
+    // camera-id change tears its stream down. Without it the assertion below
+    // would be unproven (nothing to tear down).
+    expect(gridHost().querySelectorAll('video-stream')).toHaveLength(4);
+
+    // Intercept the real teardown path per instance so the assertion below can
+    // actually fail: a prototype spy on `ngOnDestroy` cannot (PR5 finding).
+    const teardowns = playersBefore.map(spyOnTeardown);
 
     dropList().dropped.emit(dropEvent(3, 0));
     fixture.detectChanges();
+
+    // The invariant: nothing was torn down, so no stream renegotiates. Verified
+    // by mutation: `track $index` changes every player's cameraId while the
+    // element is live, which tears all four down and fails this assertion.
+    teardowns.forEach((stop) => expect(stop).not.toHaveBeenCalled());
 
     const tilesAfter = tileHosts();
     const playersAfter = players();
@@ -211,10 +287,17 @@ describe('GridViewComponent', () => {
     expect(new Set(playersAfter)).toEqual(new Set(playersBefore));
     expect(playersAfter[0]).toBe(playersBefore[3]);
     expect(playersAfter.map((player) => player.cameraId)).toEqual(['cam4', 'cam1', 'cam2', 'cam3']);
+  });
 
-    // Nothing was torn down: no reconnect can happen (the player only
-    // re-creates its element from ngOnDestroy/stopConnection).
-    expect(destroyPlayer).not.toHaveBeenCalled();
+  it('proves the per-instance teardown spy intercepts the real path (control)', () => {
+    fixture.detectChanges();
+    const [player] = players();
+    const stop = spyOnTeardown(player);
+
+    player.active = false;
+
+    // Guards the reorder assertion above against silently becoming vacuous.
+    expect(stop).toHaveBeenCalledTimes(1);
   });
 
   it('opens the camera at the pressed position with keys 1-4', () => {

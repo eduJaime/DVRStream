@@ -103,13 +103,16 @@ describe('app routes', () => {
   it('switches cameras inside the single view without recreating the player', async () => {
     const harness = await RouterTestingHarness.create('/cam/cam2');
     const player = players(harness)[0];
-    const destroy = vi.spyOn(CameraPlayerComponent.prototype, 'ngOnDestroy');
+    // Same per-instance teardown spy as the D2 test: a prototype spy on
+    // `ngOnDestroy` cannot intercept a lifecycle hook.
+    const stop = spyOnTeardown(player);
 
     await harness.navigateByUrl('/cam/cam4');
 
     expect(players(harness)).toEqual([player]);
     expect(player.cameraId).toBe('cam4');
-    expect(destroy).not.toHaveBeenCalled();
+    // The player survives the switch, so its stream is never torn down.
+    expect(stop).not.toHaveBeenCalled();
   });
 
   it('allows a configured camera id and redirects an unknown one (guard)', () => {
