@@ -297,3 +297,34 @@ Parámetro: `IP_LXC` (y usuario SSH).
 - `IP_LXC` (IP fija del contenedor)
 - `IP_DVR`, usuario, contraseña y ruta RTSP de cada cámara (solo en el LXC)
 - Subred local para el firewall (ej. `192.168.X.0/24`)
+
+---
+
+## Apéndice de reconciliación (cierre SDD `visor-camaras`, 2026-09-16)
+
+> Agregado al archivar el cambio. **No reescribe el plan ni renombra sus fases**: es el documento original del dueño y se conserva. Abajo va, sin más, cada punto donde la implementación verificada se apartó del plan y por qué. El contrato vigente es el spec `sdd/visor-camaras/spec` (25 requisitos, 100 % aditivos: nada MODIFIED ni REMOVED). Decisiones completas en `sdd/visor-camaras/design` (D1–D33); detalle end-to-end en `sdd/visor-camaras/archive-report`.
+
+| § plan | El plan dice | La implementación hace | Por qué (decisión) |
+|---|---|---|---|
+| §3.2.5 | Copiar `go2rtc.example.yaml` a `/etc/go2rtc/go2rtc.yaml` **sólo si no existe**; el operador edita la copia a mano | Script interactivo: pregunta, valida, **renderiza la config completa** y arranca el servicio; el example es sólo muestra de referencia | D7/D8/D14 · dev 8. El provisioner es el único dueño de la config |
+| §3.2.2 | Descargar el binario **más reciente** (en la práctica, cada corrida) | Descarga sólo si falta o no es ejecutable; `--upgrade` fuerza | D15 · dev 11. Re-runs offline con credenciales nuevas |
+| §3.2.5 / §3.5 / §11 | `IP_LXC` fijo, escrito a mano en el YAML | Dirección publicada auto-detectada (ruta por defecto), pisable con `--address` | D8 · dev 14 |
+| §3.2.5 | Config `600`, dueño `go2rtc` | Igual, pero el modo/dueño se aplican al temporal **antes** del `rename(2)` | D11 · dev 13. Nunca existe una config nueva con permisos flojos |
+| §10 | No commitear credenciales | Extendido: tampoco en argv, entorno, logs, `ps` ni historial; contraseña sólo por prompt oculto, archivo `0600` o stdin; un `.prev` `0600` | D9 · dev 12 |
+| §4.3 | `environment.development.ts` con `go2rtcBaseUrl = 'http://IP_LXC:1984'` | `''` (mismo origen) + `proxy.conf.json` (`ws:true`), único archivo con `IP_LXC` | dev 3. El propio plan se contradecía: §4.3 pedía URL absoluta y §4.4 pedía proxy "mismo origen". Una URL absoluta es cross-origin y **go2rtc no manda CORS por defecto** |
+| §5.1 | Copiar el reproductor a `frontend/src/assets/go2rtc/` | `frontend/public/go2rtc/` | dev 1. Son **módulos ES nativos** con import relativo `./video-rtc.js`: no cargan vía `scripts` de `angular.json`; `public/` se sirve tal cual |
+| §5.3 | Backoff "5s, 10s, 20s, tope 30s" | `[5,10,20,30]` y después 30 repetido | dev 6. Misma secuencia, tope explícito |
+| §5.4 | En vista ampliada las 3 no visibles quedan `active = false` | El router desmonta la grilla en `/cam/:id`: los 3 reproductores se **destruyen** (teardown) | D2 · dev 2. Mismo resultado de recursos; costo: una reconexión (~1 s) al ampliar |
+| §6.2 | Botones de acción "**al hacer hover**" | En dispositivos **sin hover** (`@media (hover: none)`) están **siempre visibles**; con hover se mantiene el reveal | D22 · dev 15. Hover-only es inalcanzable en un celular |
+| §6.2 | Celdas "con relación de aspecto preservada" | En el 2x2 **no** se preserva (`minmax(0,1fr)`); sólo hay `aspect-ratio` abajo de 700 px | dev 19. Llenar el viewport gana; la franja overlay tapa parte del cuadro |
+| §6.2 / §6.3 | **Doble click** en la celda es la (única) vía a `/cam/:id` | **Ampliar** es un botón explícito y siempre visible; el doble click sigue vivo en equipos con mouse | D23 · dev 16. El doble click no puede ser la única vía |
+| §6.3 / §7.3 | Drag & drop **entre celdas**: la celda entera es la superficie | El arrastre empieza **sólo desde el grip** (`cdkDragHandle`, `touch-action:none`), en todos los dispositivos | D24–D26 · dev 17. Con el umbral de 5 px, un swipe vertical iniciaba el drag y robaba el scroll |
+| §6.2 | Botones de acción sin guía de tamaño | Todo control interactivo ≥ **44×44 CSS px** y sin superposición | D28 · dev 18 (WCAG 2.5.5) |
+| §6.3 | `F` alterna pantalla completa (asumida siempre disponible) | Disponibilidad **detectada**; sin soporte el botón queda deshabilitado con explicación y la vista sigue usable | D30 · dev 20 |
+| §7.2 | Rename `Enter` guarda / `Esc` cancela, estilos libres | Editor 16 px + Guardar/Cancelar 44×44; `Enter`/`Esc` sin cambios | D32 · dev 21. Sin `Esc` en teclados táctiles; iOS hace zoom bajo 16 px |
+| §8 | Feedback de captura "flash **o** toast" | Sólo toast (servicio a nivel app) | dev 4. Un mecanismo, testable |
+| §1 / §3.3 | Sólo LAN, `candidates` fijos | Además `pcConfig.iceServers = []` (sin STUN público) | D6 · dev 7 |
+| §9 | README explica "**cómo editar** `go2rtc.yaml`" | El README documenta **correr el provisioner**; ya no hay edición a mano | D7 · S5 |
+| §3.2 (next-steps) | El script dejaba instrucciones de editar el YAML y reiniciar | El script reporta éxito (URL + próximo paso) o fallo (comando de logs + rollback) por sí mismo | D6 · S3 |
+
+**Sin reconciliación pendiente en este plan.** Los apartados de arriba son los únicos desvíos registrados (filas 1–21 del design); el resto del plan se cumplió tal cual.
