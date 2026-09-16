@@ -234,10 +234,20 @@ GOOD_CFG="${WORK_DIR}/good.yaml"
 printf '%s\n' "${rendered}" > "${GOOD_CFG}"
 assert_eq "sin error" "" "$(config_error "${GOOD_CFG}")"
 
-begin "config_error: detecta placeholders sin reemplazar"
-printf 'streams:\n  cam1: "rtsp://USUARIO:PASSWORD@IP_DVR:554/x"\n  cam2: "x"\n  cam3: "x"\n  cam4: "x"\n' \
-  > "${WORK_DIR}/placeholder.yaml"
-assert_contains "placeholder" "$(config_error "${WORK_DIR}/placeholder.yaml")" 'placeholder'
+begin "config_error: acepta credenciales que contienen USUARIO/PASSWORD (S2)"
+printf 'streams:\n  cam1: "rtsp://USUARIO:PASSWORD@10.0.0.5:554/x"\n  cam2: "x"\n  cam3: "x"\n  cam4: "x"\n' \
+  > "${WORK_DIR}/legit-tokens.yaml"
+assert_eq "sin error" "" "$(config_error "${WORK_DIR}/legit-tokens.yaml")"
+
+begin "config_error: acepta una ruta con %s dentro de la URL (S2)"
+printf 'streams:\n  cam1: "rtsp://u:p@h:554/a%%sb"\n  cam2: "x"\n  cam3: "x"\n  cam4: "x"\n' \
+  > "${WORK_DIR}/legit-percent.yaml"
+assert_eq "sin error" "" "$(config_error "${WORK_DIR}/legit-percent.yaml")"
+
+begin "config_error: detecta un placeholder estructural sin reemplazar"
+printf 'webrtc:\n  candidates:\n    - IP_LXC:8555\nstreams:\n  cam1: "x"\n  cam2: "x"\n  cam3: "x"\n  cam4: "x"\n' \
+  > "${WORK_DIR}/structural-placeholder.yaml"
+assert_contains "placeholder" "$(config_error "${WORK_DIR}/structural-placeholder.yaml")" 'placeholder'
 
 begin "config_error: detecta la plantilla sin sustituir"
 cat > "${WORK_DIR}/raw-template.yaml" <<'EOF'
@@ -283,6 +293,26 @@ begin "-p (corto) también se rechaza"
 run_capture bash "${INSTALLER}" -p 'secreto'
 assert_eq "exit 2" "2" "${RC}"
 assert_contains "mensaje" "${ERR}" 'no se acepta por línea de comandos'
+
+begin "--password=... (forma con =) también se rechaza"
+run_capture bash "${INSTALLER}" --dry-run --password=secreto
+assert_eq "exit 2" "2" "${RC}"
+assert_contains "mensaje" "${ERR}" 'no se acepta por línea de comandos'
+
+begin "--password-file=PATH (forma con =) se acepta (S1)"
+run_capture bash "${INSTALLER}" --dry-run --yes \
+  --address '10.0.0.9' --dvr-host '10.0.0.5' --dvr-user 'admin' \
+  "--password-file=${PWFILE}"
+assert_eq "exit 0" "0" "${RC}"
+assert_contains "URL enmascarada" "${OUT}" 'rtsp://admin:****@10.0.0.5:554/Streaming/Channels/101'
+
+begin "--password-file= (vacío) se rechaza con mensaje preciso (S1)"
+run_capture bash "${INSTALLER}" --dry-run --yes \
+  --address '10.0.0.9' --dvr-host '10.0.0.5' --dvr-user 'admin' \
+  '--password-file='
+assert_eq "exit 2" "2" "${RC}"
+assert_contains "falta el valor" "${ERR}" 'falta el valor de --password-file'
+assert_not_contains "no confunde con argv" "${ERR}" 'no se acepta por línea de comandos'
 
 begin "--help funciona sin root"
 run_capture bash "${INSTALLER}" --help

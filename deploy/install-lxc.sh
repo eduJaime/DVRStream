@@ -278,12 +278,23 @@ render_config() { # <address> <url1> <url2> <url3> <url4>
 
 # config_error: imprime el primer problema del YAML generado, o nada si está OK.
 config_error() {
-  local file="${1:-}" count
+  local file="${1:-}" count structure
   if [[ ! -f "${file}" ]]; then
     printf 'no se generó el archivo de configuración'
     return 0
   fi
-  if grep -qE '(IP_LXC|IP_DVR|USUARIO|PASSWORD|RUTA_CAM|%s)' -- "${file}"; then
+  # Un placeholder de la plantilla sólo puede quedar en un sitio de sustitución
+  # conocido (el candidate o una URL de stream sin reemplazar). Las líneas de
+  # streams llevan usuario/contraseña/ruta ya renderizados, que pueden contener
+  # por casualidad cadenas como USUARIO o PASSWORD: se revisan aparte con
+  # patrones exactos y el resto del YAML (estructura fija) se escanea completo.
+  if grep -qE '^[[:space:]]*cam[1-4]:[[:space:]]*"%s"[[:space:]]*$' -- "${file}" \
+    || grep -qE '^[[:space:]]*-[[:space:]]*%s:8555[[:space:]]*$' -- "${file}"; then
+    printf 'quedaron placeholders sin reemplazar en la configuración'
+    return 0
+  fi
+  structure="$(grep -vE '^[[:space:]]*cam[1-4]:' -- "${file}" || true)"
+  if grep -qE '(IP_LXC|IP_DVR|USUARIO|PASSWORD|RUTA_CAM|%s)' <<< "${structure}"; then
     printf 'quedaron placeholders sin reemplazar en la configuración'
     return 0
   fi
@@ -370,6 +381,12 @@ parse_args() {
       --dvr-host)      (( $# >= 2 )) || die 'falta el valor de --dvr-host';      DVR_HOST="$2"; shift 2 ;;
       --dvr-user)      (( $# >= 2 )) || die 'falta el valor de --dvr-user';      DVR_USER="$2"; shift 2 ;;
       --password-file) (( $# >= 2 )) || die 'falta el valor de --password-file'; PASSWORD_FILE="$2"; shift 2 ;;
+      # Misma bandera en forma `--password-file=PATH` (no lleva la contraseña
+      # en argv, sólo la ruta): se acepta antes del rechazo genérico --password*.
+      --password-file=*)
+        PASSWORD_FILE="${1#--password-file=}"
+        [[ -n "${PASSWORD_FILE}" ]] || die 'falta el valor de --password-file'
+        shift ;;
       --channels)      (( $# >= 2 )) || die 'falta el valor de --channels';      CHANNELS_CSV="$2"; shift 2 ;;
       --yes)           ASSUME_YES=1; shift ;;
       --dry-run)       DRY_RUN=1; shift ;;
