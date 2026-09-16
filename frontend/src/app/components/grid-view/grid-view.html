@@ -1,0 +1,35 @@
+<div class="grid-view">
+  <div class="grid-view__chrome">
+    @if (confirmingReset()) {
+      <span class="grid-view__question" role="status">¿Restablecer nombres y orden?</span>
+      <button type="button" class="chrome-btn" (click)="confirmReset()">Sí, restablecer</button>
+      <button type="button" class="chrome-btn" (click)="cancelReset()">Cancelar</button>
+    } @else {
+      <button type="button" class="chrome-btn" (click)="requestReset()">Restablecer</button>
+    }
+  </div>
+
+  <div
+    class="grid"
+    cdkDropList
+    cdkDropListOrientation="mixed"
+    (cdkDropListDropped)="onDrop($event)"
+  >
+    @for (camera of config.ordered(); track camera.id) {
+      <app-camera-tile
+        class="grid__cell"
+        cdkDrag
+        [cdkDragData]="camera.id"
+        [camera]="camera"
+        (open)="openCamera($event)"
+      >
+        <ng-template cdkDragPreview>
+          <div class="grid__preview">{{ camera.name }}</div>
+        </ng-template>
+        <ng-template cdkDragPlaceholder>
+          <div class="grid__placeholder"></div>
+        </ng-template>
+      </app-camera-tile>
+    }
+  </div>
+</div>

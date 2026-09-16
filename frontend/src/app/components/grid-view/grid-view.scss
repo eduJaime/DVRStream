@@ -1,0 +1,110 @@
+:host {
+  display: block;
+  position: relative;
+  /* Viewport-filling 2x2: the first routed view owns the whole screen. */
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+.grid-view {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+}
+
+/* Grid chrome (Restablecer): overlays the first tile so it consumes no layout
+   in the 2x2; below the breakpoint it flows above the tiles instead. */
+.grid-view__chrome {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  z-index: 3;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.grid-view__question {
+  padding: 0.35rem 0.5rem;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.72);
+  font-size: 0.9rem;
+}
+
+.chrome-btn {
+  /* WCAG 2.5.5 floor for every interactive control (D28). */
+  min-height: 44px;
+  padding: 0 0.75rem;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #f5f5f5;
+  font: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.chrome-btn:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.grid {
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  /* minmax(0, 1fr) stops the video's intrinsic width from overflowing (D29). */
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+  gap: 2px;
+  overflow: hidden;
+}
+
+.grid__cell {
+  min-width: 0;
+  min-height: 0;
+}
+
+/* CDK mounts these outside the tile: a plain name chip instead of a clone of
+   the live player (D5). */
+.grid__preview {
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.82);
+  color: #f5f5f5;
+  font-size: 0.95rem;
+  white-space: nowrap;
+}
+
+.grid__placeholder {
+  width: 100%;
+  height: 100%;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* Narrow viewport: one column with vertical scroll, no horizontal scroll (D29). */
+@media (max-width: 699.98px) {
+  :host {
+    height: auto;
+    min-height: 100dvh;
+    overflow: visible;
+  }
+
+  .grid-view__chrome {
+    position: static;
+    padding: 0.5rem;
+  }
+
+  .grid {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+  }
+
+  .grid__cell {
+    aspect-ratio: 16 / 9;
+  }
+}
