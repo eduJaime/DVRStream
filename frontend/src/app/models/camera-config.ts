@@ -12,3 +12,14 @@ export interface CameraConfig {
   name: string;
   order: number;
 }
+
+/**
+ * Resolves a raw route param to a configured camera id.
+ *
+ * Exact match only: an unknown id, an empty string or a missing param returns
+ * `null`, so `cam/:id` can redirect to the grid instead of rendering a broken
+ * view. Pure and TestBed-free (design D2).
+ */
+export function resolveCameraId(raw: string | null): CameraId | null {
+  return CAMERA_IDS.find((id) => id === raw) ?? null;
+}

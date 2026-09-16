@@ -1,0 +1,71 @@
+:host {
+  display: block;
+  position: relative;
+  /* The single camera fills the available space; no page scroll. */
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background: #000;
+}
+
+.single-view {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.single-view__player {
+  position: absolute;
+  inset: 0;
+}
+
+/* Overlay toolbar: travels with the host into fullscreen, so exit stays
+   reachable from inside the fullscreen state (D30). */
+.single-view__toolbar {
+  position: absolute;
+  inset-inline: 0;
+  bottom: 0;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.72), transparent);
+  /* The scrim is pointer-inert; the controls opt back in. */
+  pointer-events: none;
+}
+
+.single-view__name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 0.9rem;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+.toolbar-btn {
+  pointer-events: auto;
+  /* WCAG 2.5.5 target floor, applied on every device (D28). */
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 0.9rem;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #f5f5f5;
+  font: inherit;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.toolbar-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.toolbar-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}

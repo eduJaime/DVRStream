@@ -1,0 +1,25 @@
+@if (camera(); as cam) {
+  <div class="single-view">
+    <app-camera-player class="single-view__player" [cameraId]="cam.id" />
+
+    <div class="single-view__toolbar">
+      <span class="single-view__name" [attr.title]="cam.name">{{ cam.name }}</span>
+
+      <button type="button" class="toolbar-btn" (click)="backToGrid()">Volver a la grilla</button>
+
+      <button
+        type="button"
+        class="toolbar-btn"
+        [disabled]="!fullscreenAvailable()"
+        [attr.aria-pressed]="fullscreenActive()"
+        [attr.aria-label]="fullscreenAvailable() ? 'Pantalla completa' : fullscreenMessage"
+        [attr.title]="fullscreenAvailable() ? 'Pantalla completa' : fullscreenMessage"
+        (click)="toggleFullscreen()"
+      >
+        Pantalla completa
+      </button>
+
+      <button type="button" class="toolbar-btn" (click)="takeSnapshot()">Snapshot</button>
+    </div>
+  </div>
+}
