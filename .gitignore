@@ -1,0 +1,29 @@
+# --- Node / Angular ---------------------------------------------------------
+node_modules/
+dist/
+.angular/
+npm-debug.log*
+yarn-error.log*
+*.tsbuildinfo
+
+# --- Config real de go2rtc (NUNCA commitear: tiene credenciales RTSP) -------
+# El archivo real vive en el LXC como /etc/go2rtc/go2rtc.yaml.
+# La plantilla versionada es deploy/go2rtc.example.yaml.
+go2rtc.yaml
+/etc/go2rtc/
+
+# --- Secretos / entorno -----------------------------------------------------
+.env
+.env.*
+!.env.example
+*.local
+
+# --- SDD / agent tooling ----------------------------------------------------
+.atl/
+
+# --- Editor / SO ------------------------------------------------------------
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
