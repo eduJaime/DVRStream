@@ -1,1 +1,12 @@
 <router-outlet />
+
+@if (toast.message(); as message) {
+  <div
+    class="toast"
+    [class.toast--error]="message.tone === 'error'"
+    [attr.role]="message.tone === 'error' ? 'alert' : 'status'"
+    [attr.aria-live]="message.tone === 'error' ? 'assertive' : 'polite'"
+  >
+    {{ message.text }}
+  </div>
+}

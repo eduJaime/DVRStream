@@ -1,0 +1,151 @@
+:host {
+  display: block;
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  background: #000;
+  /* Keeps native scrolling on the cell body and drops the double-tap-zoom
+     delay; only the grip removes touch gestures (D25). */
+  touch-action: manipulation;
+}
+
+.tile {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.tile__player {
+  position: absolute;
+  inset: 0;
+}
+
+/* Grip: the only drag surface, in the corner opposite the action strip (D26). */
+.tile__grip {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  z-index: 2;
+  touch-action: none;
+  cursor: grab;
+}
+
+/* One bottom strip for the name and the actions: they can never overlap and
+   the strip consumes no layout space (D27). */
+.tile__strip {
+  position: absolute;
+  inset-inline: 0;
+  bottom: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.5rem;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.72), transparent);
+  /* Taps on the scrim fall through to the cell body. */
+  pointer-events: none;
+}
+
+.tile__name,
+.tile__editor {
+  pointer-events: auto;
+}
+
+.tile__name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: 0.9rem;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+}
+
+/* Hover devices hide the actions until hover/focus; the hidden state is
+   pointer-inert, never aria-hidden, so nothing invisible stays clickable (D22). */
+.tile__actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.25rem;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+:host(:hover) .tile__actions,
+:host(:focus-within) .tile__actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Hover-less devices (phones) always see the controls (TD-3/D22). */
+@media (hover: none) {
+  .tile__actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* WCAG 2.5.5 target floor, applied to every control on every device (D28). */
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #f5f5f5;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.icon-btn:hover {
+  background: rgba(255, 255, 255, 0.24);
+}
+
+.icon {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.tile__editor {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.tile__editor-row {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.tile__input {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 44px;
+  padding: 0 0.5rem;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.7);
+  color: #f5f5f5;
+  font: inherit;
+  /* 16px stops iOS from zooming the page when the input gets focus (D32). */
+  font-size: 16px;
+}
+
+.tile__error {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #ffb3b3;
+}

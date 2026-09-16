@@ -1,0 +1,104 @@
+<div class="tile" (dblclick)="onCellDblClick()">
+  <app-camera-player class="tile__player" [cameraId]="camera.id" />
+
+  <button
+    type="button"
+    tabindex="-1"
+    class="icon-btn tile__grip"
+    cdkDragHandle
+    [attr.aria-label]="'Reordenar ' + camera.name"
+    [attr.title]="'Reordenar ' + camera.name"
+  >
+    <svg class="icon" viewBox="0 0 24 24">
+      <path d="M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01" />
+    </svg>
+  </button>
+
+  <div class="tile__strip">
+    @if (editing()) {
+      <div class="tile__editor" (dblclick)="$event.stopPropagation()">
+        <div class="tile__editor-row">
+          <input
+            #nameInput
+            class="tile__input"
+            type="text"
+            [value]="camera.name"
+            enterkeyhint="done"
+            autocapitalize="off"
+            autocomplete="off"
+            spellcheck="false"
+            [attr.aria-label]="'Nombre de ' + camera.name"
+            (keydown.enter)="saveRename(nameInput.value)"
+            (keydown.escape)="cancelRename()"
+          />
+          <button
+            type="button"
+            class="icon-btn"
+            aria-label="Guardar nombre"
+            title="Guardar nombre"
+            (click)="saveRename(nameInput.value)"
+          >
+            <svg class="icon" viewBox="0 0 24 24">
+              <path d="M5 13l4 4L19 7" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            class="icon-btn"
+            aria-label="Cancelar"
+            title="Cancelar"
+            (click)="cancelRename()"
+          >
+            <svg class="icon" viewBox="0 0 24 24">
+              <path d="M6 6l12 12M18 6L6 18" />
+            </svg>
+          </button>
+        </div>
+        @if (renameError(); as message) {
+          <p class="tile__error" role="alert">{{ message }}</p>
+        }
+      </div>
+    } @else {
+      <span class="tile__name" [attr.title]="camera.name" (dblclick)="onNameDblClick($event)">
+        {{ camera.name }}
+      </span>
+      <div class="tile__actions" (dblclick)="$event.stopPropagation()">
+        <button
+          type="button"
+          class="icon-btn"
+          [attr.aria-label]="'Ampliar ' + camera.name"
+          [attr.title]="'Ampliar ' + camera.name"
+          (click)="openSingleView()"
+        >
+          <svg class="icon" viewBox="0 0 24 24">
+            <path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="icon-btn"
+          [attr.aria-label]="'Snapshot ' + camera.name"
+          [attr.title]="'Snapshot ' + camera.name"
+          (click)="takeSnapshot()"
+        >
+          <svg class="icon" viewBox="0 0 24 24">
+            <path d="M4 8h3l2-3h6l2 3h3v11H4z" />
+            <path d="M12 16.5a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="icon-btn"
+          [attr.aria-label]="'Renombrar ' + camera.name"
+          [attr.title]="'Renombrar ' + camera.name"
+          (click)="startRename()"
+        >
+          <svg class="icon" viewBox="0 0 24 24">
+            <path d="M4 20h4L18.5 9.5l-4-4L4 16v4z" />
+            <path d="M14 5.5l4 4" />
+          </svg>
+        </button>
+      </div>
+    }
+  </div>
+</div>
