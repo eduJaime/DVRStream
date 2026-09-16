@@ -44,7 +44,7 @@ describe('CameraPlayerComponent (module script loading)', () => {
     expect(fixture.componentInstance.status()).toBe('error');
   });
 
-  it('re-injects the script on the next retry after a failed load', async () => {
+  it('re-injects the script only after the full 5s backoff', async () => {
     vi.useFakeTimers();
     fixture.detectChanges();
 
@@ -57,7 +57,12 @@ describe('CameraPlayerComponent (module script loading)', () => {
     // The failed tag is dropped so the retry can inject a fresh one.
     expect(document.querySelector(SCRIPT_SELECTOR)).toBeNull();
 
-    vi.advanceTimersByTime(5_000);
+    // A failed load must not be re-injected before the mandated 5s backoff.
+    vi.advanceTimersByTime(4_999);
+    await flushMicrotasks();
+    expect(document.querySelector(SCRIPT_SELECTOR)).toBeNull();
+
+    vi.advanceTimersByTime(1);
     await flushMicrotasks();
 
     const reInjected = document.querySelector(SCRIPT_SELECTOR) as HTMLScriptElement | null;
