@@ -9,9 +9,13 @@ import {
   OnInit,
   Output,
   ViewChild,
+  effect,
+  inject,
   signal,
 } from '@angular/core';
 import { environment } from '../../../environments/environment';
+import { VisibilityService } from '../../services/visibility.service';
+import { nextRetryDelay } from '../../util/retry-backoff';
 import { buildStreamUrl } from './stream-url';
 
 export type CameraPlayerStatus = 'connecting' | 'playing' | 'error';
@@ -48,9 +52,7 @@ interface PlayerMessage {
 const PLAYER_CUSTOM_ELEMENT = 'video-stream';
 const PLAYER_SCRIPT_ID = 'go2rtc-video-stream-script';
 const PLAYER_SCRIPT_PATH = 'go2rtc/video-stream.js';
-
-/** Retry backoff in milliseconds: 5s -> 10s -> 20s -> 30s (capped). */
-const RETRY_DELAYS_MS = [5_000, 10_000, 20_000, 30_000];
+const PLAYER_SCRIPT_ERROR = 'No se pudo cargar el reproductor de go2rtc';
 const CONNECT_TIMEOUT_MS = 8_000;
 
 @Component({
@@ -69,9 +71,11 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
   /** Current stream status, exposed for the grid/single views. */
   readonly status = signal<CameraPlayerStatus>('connecting');
 
+  private readonly visibility = inject(VisibilityService);
+
   private cameraIdValue = '';
   private activeRequested = true;
-  private tabVisible = true;
+  private initialized = false;
   private destroyed = false;
 
   private playerEl: VideoStreamElement | null = null;
@@ -81,9 +85,18 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
   private retryTID: number | null = null;
   private connectTimeoutTID: number | null = null;
 
-  private readonly visibilityHandler = (): void => this.onVisibilityChange();
   private readonly onVideoPlaying = (): void => this.onPlaying();
   private readonly onVideoError = (): void => this.onConnectionLost();
+
+  constructor() {
+    // One shared `visibilitychange` seam for every player (design D4).
+    effect(() => {
+      const tabVisible = this.visibility.tabVisible();
+      if (!this.initialized) return;
+      if (tabVisible) this.retryAttempt = 0;
+      this.applyConnectionState();
+    });
+  }
 
   @Input({ required: true })
   set cameraId(value: string) {
@@ -111,14 +124,12 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
   }
 
   ngOnInit(): void {
-    this.tabVisible = !document.hidden;
-    document.addEventListener('visibilitychange', this.visibilityHandler);
+    this.initialized = true;
     this.applyConnectionState();
   }
 
   ngOnDestroy(): void {
     this.destroyed = true;
-    document.removeEventListener('visibilitychange', this.visibilityHandler);
     this.stopConnection();
   }
 
@@ -150,23 +161,21 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
 
   /** Manual retry: resets the backoff and reconnects immediately. */
   retry(): void {
-    if (this.destroyed || !this.activeRequested || !this.tabVisible) return;
+    if (!this.canRun()) return;
     this.cancelRetry();
     this.retryAttempt = 0;
     this.stopConnection();
     this.applyConnectionState();
   }
 
-  private onVisibilityChange(): void {
-    this.tabVisible = !document.hidden;
-    if (this.tabVisible) this.retryAttempt = 0;
-    this.applyConnectionState();
+  /** Run condition: mounted ∧ active ∧ tab visible (design D4). */
+  private canRun(): boolean {
+    return !this.destroyed && this.activeRequested && this.visibility.tabVisible();
   }
 
   /** Single place that decides whether the stream must be running. */
   private applyConnectionState(): void {
-    const shouldRun = !this.destroyed && this.activeRequested && this.tabVisible;
-    if (shouldRun) this.startConnection();
+    if (this.canRun()) this.startConnection();
     else this.stopConnection();
   }
 
@@ -178,7 +187,7 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
 
     this.ensurePlayerScriptLoaded()
       .then(() => {
-        if (this.playerEl || this.destroyed || !this.activeRequested || !this.tabVisible) return;
+        if (this.playerEl || !this.canRun()) return;
         this.createPlayerElement();
       })
       .catch(() => this.onConnectionLost());
@@ -188,14 +197,26 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
     if (customElements.get(PLAYER_CUSTOM_ELEMENT)) return Promise.resolve();
 
     if (!this.playerScriptPromise) {
-      this.playerScriptPromise = new Promise<void>((resolve) => {
-        if (!document.getElementById(PLAYER_SCRIPT_ID)) {
-          const script = document.createElement('script');
-          script.id = PLAYER_SCRIPT_ID;
-          script.type = 'module';
-          script.src = new URL(PLAYER_SCRIPT_PATH, document.baseURI).href;
-          document.head.appendChild(script);
-        }
+      this.playerScriptPromise = new Promise<void>((resolve, reject) => {
+        const existing = document.getElementById(PLAYER_SCRIPT_ID) as HTMLScriptElement | null;
+        const script = existing ?? document.createElement('script');
+        script.id = PLAYER_SCRIPT_ID;
+        script.type = 'module';
+        script.src = new URL(PLAYER_SCRIPT_PATH, document.baseURI).href;
+
+        // A failed load must not leave the player stuck on "Conectando…":
+        // drop the tag and the cached promise so the next retry injects again.
+        script.addEventListener(
+          'error',
+          () => {
+            script.remove();
+            this.playerScriptPromise = null;
+            reject(new Error(PLAYER_SCRIPT_ERROR));
+          },
+          { once: true },
+        );
+
+        if (!existing) document.head.appendChild(script);
         customElements.whenDefined(PLAYER_CUSTOM_ELEMENT).then(() => resolve());
       });
     }
@@ -218,7 +239,10 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
 
     // The component owns reconnection. Any connect attempt not explicitly
     // requested below is treated as a connection loss and drives our backoff.
+    // Every wrapped hook bails when its element is no longer the live player,
+    // so a late socket event cannot resurrect a torn-down stream (design §5.4).
     el.onconnect = () => {
+      if (this.playerEl !== el) return false;
       if (!this.allowNativeConnect) {
         this.onConnectionLost();
         return false;
@@ -230,6 +254,7 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
     };
 
     el.onopen = () => {
+      if (this.playerEl !== el) return [];
       const modes = nativeOpen();
       this.wrapStreamMessage(el);
       this.setStatus('connecting');
@@ -238,6 +263,7 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
     };
 
     el.onclose = () => {
+      if (this.playerEl !== el) return false;
       const reconnecting = nativeClose();
       if (el.reconnectTID) {
         clearTimeout(el.reconnectTID);
@@ -279,20 +305,21 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
 
     const original = el.onmessage['stream'];
     el.onmessage['stream'] = (msg: PlayerMessage) => {
+      if (this.playerEl !== el) return;
       original?.(msg);
       if (msg.type === 'error') this.onConnectionLost();
     };
   }
 
   private onPlaying(): void {
-    if (this.destroyed) return;
+    if (!this.canRun()) return;
     this.retryAttempt = 0;
     this.clearConnectTimeout();
     this.setStatus('playing');
   }
 
   private onConnectionLost(): void {
-    if (this.destroyed || !this.activeRequested || !this.tabVisible) return;
+    if (!this.canRun()) return;
 
     this.clearConnectTimeout();
     this.teardownPlayer();
@@ -301,17 +328,15 @@ export class CameraPlayerComponent implements OnInit, OnDestroy {
   }
 
   private scheduleRetry(): void {
-    if (this.destroyed || !this.activeRequested || !this.tabVisible || this.retryTID !== null) {
-      return;
-    }
+    if (!this.canRun() || this.retryTID !== null) return;
 
-    const delay = RETRY_DELAYS_MS[Math.min(this.retryAttempt, RETRY_DELAYS_MS.length - 1)];
+    const delayMs = nextRetryDelay(this.retryAttempt) * 1_000;
     this.retryAttempt += 1;
 
     this.retryTID = window.setTimeout(() => {
       this.retryTID = null;
       this.startConnection();
-    }, delay);
+    }, delayMs);
   }
 
   private armConnectTimeout(): void {

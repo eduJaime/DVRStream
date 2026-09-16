@@ -35,16 +35,22 @@ function isCameraId(value: unknown): value is CameraId {
 }
 
 function isValidOrder(value: unknown): value is number {
-  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < CAMERA_IDS.length;
+  return (
+    typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < CAMERA_IDS.length
+  );
 }
 
 /**
- * Strictly validates a raw `localStorage` value and returns a safe config.
+ * Validates a raw `localStorage` value and returns a safe config.
  *
- * The parsed value must be an array with exactly one entry per camera id,
- * each entry having a valid `id`, a non-empty `name` (1..30 chars) and a
- * unique integer `order` in `0..3`. Any deviation (invalid JSON, wrong
- * shape, missing/duplicated ids or orders) falls back to the defaults.
+ * The parsed value must be an array of entries, each with a known `id`, a
+ * non-empty `name` (1..30 chars) and a unique integer `order` in `0..3`.
+ * Duplicated ids keep the first occurrence and drop the rest; afterwards the
+ * result is re-validated so the four camera ids are present exactly once.
+ *
+ * Any other deviation (invalid JSON, wrong shape, an id missing after
+ * deduplication, an invalid name, an unknown id, or duplicated/out-of-range
+ * orders) falls back to the defaults.
  *
  * This function is pure so it can be unit-tested without Angular TestBed.
  */
@@ -58,9 +64,7 @@ export function parseStoredConfig(raw: string | null): CameraConfig[] {
     return defaultCameraConfig();
   }
 
-  if (!Array.isArray(data) || data.length !== CAMERA_IDS.length) {
-    return defaultCameraConfig();
-  }
+  if (!Array.isArray(data)) return defaultCameraConfig();
 
   const seenIds = new Set<CameraId>();
   const seenOrders = new Set<number>();
@@ -71,8 +75,11 @@ export function parseStoredConfig(raw: string | null): CameraConfig[] {
 
     const { id, name, order } = entry as Record<string, unknown>;
 
-    if (!isCameraId(id) || seenIds.has(id)) return defaultCameraConfig();
-    if (typeof name !== 'string' || normalizeCameraName(name) === null) return defaultCameraConfig();
+    if (!isCameraId(id)) return defaultCameraConfig();
+    // First occurrence wins; later entries with the same id are dropped whole.
+    if (seenIds.has(id)) continue;
+    if (typeof name !== 'string' || normalizeCameraName(name) === null)
+      return defaultCameraConfig();
     if (!isValidOrder(order) || seenOrders.has(order)) return defaultCameraConfig();
 
     seenIds.add(id);

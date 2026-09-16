@@ -29,11 +29,36 @@ describe('CameraConfigService', () => {
 
   it('rejects invalid names without changing state', () => {
     const service = new CameraConfigService();
-    service.rename('cam1', '');
-    service.rename('cam1', '   ');
-    service.rename('cam1', 'x'.repeat(31));
+    expect(service.rename('cam1', '')).toBe(false);
+    expect(service.rename('cam1', '   ')).toBe(false);
+    expect(service.rename('cam1', 'x'.repeat(31))).toBe(false);
 
     expect(service.config()).toEqual(DEFAULTS);
+  });
+
+  it('reports acceptance of a valid rename', () => {
+    const service = new CameraConfigService();
+    expect(service.rename('cam2', '  Patio  ')).toBe(true);
+    expect(service.config().find((c) => c.id === 'cam2')?.name).toBe('Patio');
+  });
+
+  it('rejects invalid names without persisting and keeps the previous name', () => {
+    const service = new CameraConfigService();
+    service.rename('cam1', 'Entrada');
+
+    const setSpy = vi.spyOn(localStorage, 'setItem');
+    expect(service.rename('cam1', '   ')).toBe(false);
+    expect(service.rename('cam1', 'x'.repeat(31))).toBe(false);
+
+    expect(setSpy).not.toHaveBeenCalled();
+    expect(service.config().find((c) => c.id === 'cam1')?.name).toBe('Entrada');
+    expect(new CameraConfigService().config().find((c) => c.id === 'cam1')?.name).toBe('Entrada');
+  });
+
+  it('never truncates an over-length name', () => {
+    const service = new CameraConfigService();
+    expect(service.rename('cam1', 'x'.repeat(45))).toBe(false);
+    expect(service.config().find((c) => c.id === 'cam1')?.name).toBe('Cámara 1');
   });
 
   it('reorders cameras and renumbers order values', () => {

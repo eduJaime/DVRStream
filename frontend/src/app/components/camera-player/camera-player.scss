@@ -19,6 +19,11 @@
   display: block;
 }
 
+/* The vendored player injects its own status overlay; ours is the only one shown. */
+.stage ::ng-deep video-stream .info {
+  display: none;
+}
+
 .overlay {
   position: absolute;
   inset: 0;

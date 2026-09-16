@@ -19,16 +19,23 @@ export class CameraConfigService {
     [...this.configSignal()].sort((a, b) => a.order - b.order),
   );
 
-  /** Renames a camera. Invalid names (empty or > 30 chars) are rejected. */
-  rename(id: CameraId, name: string): void {
+  /**
+   * Renames a camera and persists the change.
+   *
+   * Invalid names (empty, all-whitespace or longer than 30 chars) are rejected:
+   * the previous name is kept, nothing is persisted and `false` is returned so
+   * the caller can surface an inline error. The name is never truncated.
+   */
+  rename(id: CameraId, name: string): boolean {
     const normalized = normalizeCameraName(name);
-    if (normalized === null) return;
+    if (normalized === null) return false;
 
     this.persist(
       this.configSignal().map((camera) =>
         camera.id === id ? { ...camera, name: normalized } : camera,
       ),
     );
+    return true;
   }
 
   /** Moves the camera at `fromIndex` to `toIndex` and renumbers `order`. */

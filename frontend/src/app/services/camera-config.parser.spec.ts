@@ -1,5 +1,9 @@
 import { CameraConfig } from '../models/camera-config';
-import { defaultCameraConfig, normalizeCameraName, parseStoredConfig } from './camera-config.parser';
+import {
+  defaultCameraConfig,
+  normalizeCameraName,
+  parseStoredConfig,
+} from './camera-config.parser';
 
 const DEFAULTS = defaultCameraConfig();
 
@@ -58,9 +62,36 @@ describe('parseStoredConfig', () => {
     expect(parseStoredConfig(JSON.stringify(config))).toEqual(DEFAULTS);
   });
 
-  it('rejects a config with a duplicated id', () => {
+  it('falls back to defaults when dropping duplicate ids leaves an id missing', () => {
     const config = validConfig().map((c) => (c.id === 'cam4' ? { ...c, id: 'cam1' } : c));
     expect(parseStoredConfig(JSON.stringify(config))).toEqual(DEFAULTS);
+  });
+
+  it('keeps the first occurrence of a duplicated id and drops the rest', () => {
+    const stored = [
+      { id: 'cam1', name: 'Entrada', order: 3 },
+      { id: 'cam4', name: 'Fondo', order: 0 },
+      { id: 'cam1', name: 'Duplicada', order: 1 },
+      { id: 'cam2', name: 'Patio', order: 2 },
+      { id: 'cam3', name: 'Garage', order: 1 },
+    ];
+
+    expect(parseStoredConfig(JSON.stringify(stored))).toEqual([
+      { id: 'cam4', name: 'Fondo', order: 0 },
+      { id: 'cam3', name: 'Garage', order: 1 },
+      { id: 'cam2', name: 'Patio', order: 2 },
+      { id: 'cam1', name: 'Entrada', order: 3 },
+    ]);
+  });
+
+  it('drops an extra duplicate entry and revalidates the four unique cameras', () => {
+    const stored = [...validConfig(), { id: 'cam1', name: 'Extra', order: 1 }];
+    expect(parseStoredConfig(JSON.stringify(stored))).toEqual(validConfig());
+  });
+
+  it('does not let a corrupt duplicate entry poison the config', () => {
+    const stored = [...validConfig(), { id: 'cam1', name: 'x'.repeat(200), order: 99 }];
+    expect(parseStoredConfig(JSON.stringify(stored))).toEqual(validConfig());
   });
 
   it('rejects duplicated or out-of-range order values', () => {
@@ -84,8 +115,8 @@ describe('parseStoredConfig', () => {
     expect(parseStoredConfig(JSON.stringify(longName))).toEqual(DEFAULTS);
   });
 
-  it('rejects configs with a different number of cameras', () => {
-    const extra = [...validConfig(), { id: 'cam1', name: 'Extra', order: 4 }];
+  it('falls back to defaults when an extra entry has an unknown id', () => {
+    const extra = [...validConfig(), { id: 'cam5', name: 'Extra', order: 4 }];
     expect(parseStoredConfig(JSON.stringify(extra))).toEqual(DEFAULTS);
   });
 });
