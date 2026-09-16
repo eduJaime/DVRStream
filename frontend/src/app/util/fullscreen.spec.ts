@@ -36,6 +36,28 @@ describe('detectFullscreenSupport', () => {
     expect(detectFullscreenSupport(doc, doc.documentElement)).toBe(true);
   });
 
+  it('accepts a WebKit-prefixed-only browser without the standard flag (D30 row 2)', () => {
+    // WebKit-only browsers do not expose `document.fullscreenEnabled` at all;
+    // the prefixed request method is the capability signal there (finding W5).
+    const doc = fakeDocument({
+      fullscreenEnabled: undefined,
+      documentElement: fakeTarget({ webkitRequestFullscreen: () => Promise.resolve() }),
+    });
+
+    expect(detectFullscreenSupport(doc, doc.documentElement)).toBe(true);
+  });
+
+  it('keeps an explicit fullscreen-disabled policy ahead of the prefixed request', () => {
+    // `fullscreenEnabled === false` is the platform refusing (e.g. an iframe
+    // without allowfullscreen): enabling the control would be a dead end.
+    const doc = fakeDocument({
+      fullscreenEnabled: false,
+      documentElement: fakeTarget({ webkitRequestFullscreen: () => Promise.resolve() }),
+    });
+
+    expect(detectFullscreenSupport(doc, doc.documentElement)).toBe(false);
+  });
+
   it('rejects a document where fullscreen is disabled, even with the API present', () => {
     const doc = fakeDocument({ fullscreenEnabled: false });
 

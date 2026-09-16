@@ -23,20 +23,27 @@ export interface FullscreenDocument {
 }
 
 /**
- * True only when the document reports fullscreen as enabled AND the target
- * (the single-view host, by default the document element) exposes a request
- * method. `disabled` + explanation is the fallback, never a dead end.
+ * True when the single view can go fullscreen.
+ *
+ * Rules (design D30):
+ * - `fullscreenEnabled === false` is the platform refusing (iframe policy):
+ *   neither path can succeed, so the control stays disabled.
+ * - Standard API present → only enabled when the document reports it enabled.
+ * - WebKit-prefixed only → those browsers do not expose the standard flag, so
+ *   `webkitRequestFullscreen` itself is the capability signal (D30 row 2).
+ *   Runtime rejections still degrade through the request `.catch()`.
  */
 export function detectFullscreenSupport(
   doc: FullscreenDocument,
   target?: FullscreenTarget,
 ): boolean {
-  if (doc.fullscreenEnabled !== true) return false;
+  if (doc.fullscreenEnabled === false) return false;
+
   const element = target ?? doc.documentElement;
-  return (
-    typeof element.requestFullscreen === 'function' ||
-    typeof element.webkitRequestFullscreen === 'function'
-  );
+  if (typeof element.requestFullscreen === 'function') {
+    return doc.fullscreenEnabled === true;
+  }
+  return typeof element.webkitRequestFullscreen === 'function';
 }
 
 /** True while any element is fullscreen in this document. */
