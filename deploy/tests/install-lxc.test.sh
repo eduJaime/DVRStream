@@ -343,6 +343,65 @@ run_capture bash "${INSTALLER}" --dry-run \
 assert_eq "exit 2" "2" "${RC}"
 assert_contains "falta --yes" "${ERR}" 'falta --yes'
 
+printf '\n== versión de go2rtc fijada (pin) ==\n'
+
+begin "el pin es v1.9.14 y la URL usa el tag, no latest"
+assert_eq "tag fijado" "v1.9.14" "${GO2RTC_VERSION_PINNED}"
+default_version="$(env -u GO2RTC_VERSION bash -c 'source "$1"; printf "%s" "${GO2RTC_VERSION}"' _ "${INSTALLER}")"
+assert_eq "GO2RTC_VERSION por defecto" "${GO2RTC_VERSION_PINNED}" "${default_version}"
+assert_eq "URL del asset fijado" \
+  'https://github.com/AlexxIT/go2rtc/releases/download/v1.9.14/go2rtc_linux_amd64' \
+  "$(go2rtc_download_url "${GO2RTC_VERSION_PINNED}" 'go2rtc_linux_amd64')"
+assert_not_contains "sin /latest/ en la URL" \
+  "$(go2rtc_download_url "${GO2RTC_VERSION_PINNED}" 'go2rtc_linux_arm64')" '/latest/'
+
+begin "--go2rtc-version pisa el tag fijado y viaja a la URL"
+flag_version="$( ( parse_args --go2rtc-version 'v1.9.15'; printf '%s' "${GO2RTC_VERSION}" ) )"
+assert_eq "tag por flag" "v1.9.15" "${flag_version}"
+flag_url="$( ( parse_args --go2rtc-version 'v1.9.15'; go2rtc_download_url "${GO2RTC_VERSION}" 'go2rtc_linux_arm64' ) )"
+assert_eq "URL del tag override" \
+  'https://github.com/AlexxIT/go2rtc/releases/download/v1.9.15/go2rtc_linux_arm64' \
+  "${flag_url}"
+
+begin "GO2RTC_VERSION del entorno pisa el tag fijado"
+env_version="$(
+  export GO2RTC_VERSION='v1.9.16'
+  source "${INSTALLER}"
+  printf '%s' "${GO2RTC_VERSION}"
+)"
+assert_eq "tag por entorno" "v1.9.16" "${env_version}"
+
+begin "go2rtc_version_warning: silencio con el tag fijado"
+assert_eq "sin aviso" "" "$(go2rtc_version_warning "${GO2RTC_VERSION_PINNED}")"
+
+begin "go2rtc_version_warning: avisa al mover el tag y apunta a VERSION.txt"
+pin_warning="$(go2rtc_version_warning 'v1.9.15')"
+assert_contains "tag pedido" "${pin_warning}" 'v1.9.15'
+assert_contains "tag vendorizado" "${pin_warning}" "${GO2RTC_VERSION_PINNED}"
+assert_contains "ruta de VERSION.txt" "${pin_warning}" 'frontend/public/go2rtc/VERSION.txt'
+
+begin "is_valid_go2rtc_version: acepta tags de release"
+assert_accepts "v1.9.14" is_valid_go2rtc_version 'v1.9.14'
+assert_accepts "v2.0.0" is_valid_go2rtc_version 'v2.0.0'
+
+begin "is_valid_go2rtc_version: rechaza latest, sin v e inyección de URL"
+assert_rejects "latest" is_valid_go2rtc_version 'latest'
+assert_rejects "sin v" is_valid_go2rtc_version '1.9.14'
+assert_rejects "con ruta" is_valid_go2rtc_version 'v1.9.14/../evil'
+assert_rejects "vacío" is_valid_go2rtc_version ''
+
+begin "--go2rtc-version latest se rechaza (exit 2)"
+run_capture bash "${INSTALLER}" --dry-run --yes --go2rtc-version 'latest' \
+  --address '10.0.0.9' --dvr-host '10.0.0.5' --dvr-user 'admin' \
+  --password-file "${PWFILE}"
+assert_eq "exit 2" "2" "${RC}"
+assert_contains "razón" "${ERR}" 'versión inválida'
+
+begin "--go2rtc-version sin valor se rechaza"
+run_capture bash "${INSTALLER}" --go2rtc-version
+assert_eq "exit 2" "2" "${RC}"
+assert_contains "falta el valor" "${ERR}" 'falta el valor de --go2rtc-version'
+
 printf '\n== --dry-run end-to-end (D7) ==\n'
 
 begin "--dry-run: config válida, enmascarada y sin root"

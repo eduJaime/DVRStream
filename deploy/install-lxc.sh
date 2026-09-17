@@ -10,6 +10,11 @@
 # Pensado para un LXC Debian 12 nativo (sin Docker). IDEMPOTENTE: volver a
 # correrlo es la forma soportada de rotar credenciales o cambiar rutas.
 #
+# El binario queda FIJADO al tag GO2RTC_VERSION_PINNED (v1.9.14): el mismo del
+# reproductor vendorizado en frontend/public/go2rtc/VERSION.txt. Se puede pedir
+# otro tag con --go2rtc-version (o GO2RTC_VERSION), pero el script avisa que hay
+# que re-copiar los JS del front desde ese tag.
+#
 # Uso interactivo (necesita TTY: ojo con `ssh` sin -t):
 #   scp -r deploy root@IP_LXC:/root/
 #   ssh -t root@IP_LXC 'bash /root/deploy/install-lxc.sh'
@@ -44,7 +49,10 @@ WWW_DIR="/opt/visor-camaras/www"
 SERVICE_NAME="go2rtc"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 RUN_USER="go2rtc"
-GO2RTC_RELEASE_URL="https://github.com/AlexxIT/go2rtc/releases/latest/download"
+# Versión fijada: la misma del reproductor vendorizado en el front
+# (frontend/public/go2rtc/VERSION.txt). Nunca se descarga `latest`.
+GO2RTC_VERSION_PINNED="v1.9.14"
+GO2RTC_RELEASES_URL="https://github.com/AlexxIT/go2rtc/releases"
 DEFAULT_CHANNELS=(
   "/Streaming/Channels/101"
   "/Streaming/Channels/201"
@@ -63,6 +71,7 @@ DVR_PASSWORD=""
 PASSWORD_FILE="${DVR_PASSWORD_FILE:-}"
 CHANNELS_CSV="${DVR_CHANNELS:-}"
 CHANNEL_PATHS=()
+GO2RTC_VERSION="${GO2RTC_VERSION:-${GO2RTC_VERSION_PINNED}}"
 
 DRY_RUN=0
 ASSUME_YES=0
@@ -185,14 +194,38 @@ is_valid_channel_path() {
   return 0
 }
 
+# is_valid_go2rtc_version: tag de release tipo v1.9.14. Nada de `latest` ni de
+# caracteres que puedan ensuciar la URL de descarga.
+is_valid_go2rtc_version() {
+  local version="${1:-}"
+  [[ "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
 validation_reason() {
   case "${1:-}" in
     is_ipv4)                printf 'dirección inválida: se espera IPv4' ;;
     is_valid_dvr_host)      printf 'host del DVR inválido (sin rtsp://, puerto ni ruta)' ;;
     is_valid_user)          printf 'usuario inválido' ;;
     is_valid_channel_path)  printf 'ruta de canal inválida' ;;
+    is_valid_go2rtc_version) printf 'versión inválida: se espera un tag de release (p. ej. v1.9.14)' ;;
     *)                      printf 'valor inválido' ;;
   esac
+}
+
+# go2rtc_download_url <version> <asset>: URL del binario para un tag exacto.
+go2rtc_download_url() {
+  printf '%s/download/%s/%s' "${GO2RTC_RELEASES_URL}" "${1:-}" "${2:-}"
+}
+
+# go2rtc_version_warning <version>: aviso si el tag pedido no es el fijado, o
+# vacío si coinciden (el front sólo vendoriza los JS de GO2RTC_VERSION_PINNED).
+go2rtc_version_warning() {
+  local version="${1:-}"
+  if [[ "${version}" != "${GO2RTC_VERSION_PINNED}" ]]; then
+    printf 'se instalará go2rtc %s y el front vendoriza %s: re-copiá video-rtc.js y video-stream.js del tag %s y actualizá frontend/public/go2rtc/VERSION.txt' \
+      "${version}" "${GO2RTC_VERSION_PINNED}" "${version}"
+  fi
+  return 0
 }
 
 # password_file_error: imprime la razón por la que el archivo no sirve, o nada.
@@ -354,6 +387,7 @@ Opciones:
   --dvr-user USER           usuario del DVR (requerido)
   --password-file PATH      archivo modo 0600 con la contraseña; '-' = stdin
   --channels "p1,p2,p3,p4"  rutas RTSP de los 4 canales
+  --go2rtc-version TAG      tag de go2rtc a instalar (default: v1.9.14, el del front)
   --yes                     no pedir confirmación (runs desatendidos)
   --dry-run                 validar y renderizar a stdout, sin escribir ni root
   --upgrade                 forzar la re-descarga del binario
@@ -361,7 +395,7 @@ Opciones:
   -h, --help                esta ayuda
 
 Entorno equivalente: LXC_ADDRESS, DVR_HOST, DVR_USER, DVR_PASSWORD_FILE,
-DVR_CHANNELS. La contraseña NUNCA se acepta por línea de comandos.
+DVR_CHANNELS, GO2RTC_VERSION. La contraseña NUNCA se acepta por línea de comandos.
 EOF
 }
 
@@ -388,6 +422,7 @@ parse_args() {
         [[ -n "${PASSWORD_FILE}" ]] || die 'falta el valor de --password-file'
         shift ;;
       --channels)      (( $# >= 2 )) || die 'falta el valor de --channels';      CHANNELS_CSV="$2"; shift 2 ;;
+      --go2rtc-version) (( $# >= 2 )) || die 'falta el valor de --go2rtc-version'; GO2RTC_VERSION="$2"; shift 2 ;;
       --yes)           ASSUME_YES=1; shift ;;
       --dry-run)       DRY_RUN=1; shift ;;
       --upgrade)       FORCE_UPGRADE=1; shift ;;
@@ -401,6 +436,9 @@ parse_args() {
       *)  die "argumento inesperado: $1" ;;
     esac
   done
+  # Flag y entorno pasan por el mismo validador (GO2RTC_VERSION ya resuelto).
+  is_valid_go2rtc_version "${GO2RTC_VERSION}" \
+    || die "$(validation_reason is_valid_go2rtc_version)"
 }
 
 print_encoded_stdin() {
@@ -434,16 +472,19 @@ phase_binary() {
     log "Binario ya instalado: ${BIN_PATH} (usá --upgrade para forzar)"
     return 0
   fi
-  local asset
+  local asset url warning
   case "$(uname -m)" in
     x86_64|amd64)  asset="go2rtc_linux_amd64" ;;
     aarch64|arm64) asset="go2rtc_linux_arm64" ;;
     armv7l)        asset="go2rtc_linux_arm"   ;;
     *)             fatal "Arquitectura no soportada: $(uname -m)" ;;
   esac
-  log "Descargando go2rtc (${asset})..."
+  warning="$(go2rtc_version_warning "${GO2RTC_VERSION}")"
+  [[ -z "${warning}" ]] || warn "${warning}"
+  log "Descargando go2rtc ${GO2RTC_VERSION} (${asset})..."
+  url="$(go2rtc_download_url "${GO2RTC_VERSION}" "${asset}")"
   TMP_BIN="$(mktemp)"
-  curl -fsSL "${GO2RTC_RELEASE_URL}/${asset}" -o "${TMP_BIN}"
+  curl -fsSL "${url}" -o "${TMP_BIN}"
   [[ -s "${TMP_BIN}" ]] || fatal 'La descarga del binario quedó vacía'
   install -m 0755 -o root -g root -- "${TMP_BIN}" "${BIN_PATH}"
   rm -f -- "${TMP_BIN}"
