@@ -52,7 +52,7 @@ DVRStream/
 **Máquina de desarrollo**
 
 - Node.js **LTS** (probado con v22) y npm
-- `rsync` y acceso SSH al LXC
+- `rsync` y acceso SSH al LXC (ver [acceso SSH sin contraseña](#acceso-ssh-sin-contraseña-una-sola-vez))
 - Angular CLI no hace falta instalarlo global: se usa `npx ng ...`
 
 **LXC**
@@ -67,6 +67,50 @@ DVRStream/
 ### 1. Crear el LXC
 
 Se crea a mano en Proxmox (Debian 12, no privilegiado, IP fija). Anotar la IP como `IP_LXC`.
+
+### Acceso SSH sin contraseña (una sola vez)
+
+`install-lxc.sh` y `deploy-frontend.sh` abren conexiones SSH al LXC (el segundo,
+`rsync` sobre SSH). Sin clave, cada conexión pide contraseña. Se configura **una
+sola vez** y listo.
+
+> **Por qué no `ssh-copy-id`:** Debian 12 trae `PermitRootLogin prohibit-password`
+> por defecto, así que `ssh-copy-id root@IP_LXC` con contraseña **falla** — no es
+> un error tuyo: el contenedor rechaza el login por contraseña para `root`. La
+> clave se instala desde la **consola de Proxmox** del LXC.
+
+**Instalá la clave pública desde la consola de Proxmox** (dentro del LXC, como `root`):
+
+```bash
+mkdir -p /root/.ssh && chmod 700 /root/.ssh
+cat >> /root/.ssh/authorized_keys <<'EOF'
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOVV5nf7wt77xbSfleS7LMI6H2kI7OndvdBnk+r07Nrm edudjaime@hotmail.com
+EOF
+chmod 600 /root/.ssh/authorized_keys
+```
+
+**Verificá** desde la PC de desarrollo:
+
+```bash
+ssh root@IP_LXC 'echo listo'
+```
+
+La primera conexión pregunta si aceptar la host key: respondé `yes`. Si imprime
+`listo` **sin pedir contraseña**, quedó.
+
+**Desplegá**: `./deploy/deploy-frontend.sh IP_LXC` ya no pregunta nada. El puerto
+SSH por defecto es 22 y se puede pisar con `SSH_PORT=2222 ./deploy/deploy-frontend.sh IP_LXC`.
+
+> Este mismo acceso lo usa el paso 2 (`scp` + `ssh` del provisioner): es
+> **prerequisito de todo**, no sólo del front.
+
+**Si algo falla:**
+
+| Error | Causa real | Solución |
+|---|---|---|
+| `Permission denied (publickey)` | La clave no está en `/root/.ssh/authorized_keys`, o el archivo/directorio tiene permisos incorrectos | Revisá la clave y reponé permisos: `chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys` |
+| `Connection refused` | `sshd` no está instalado o no está corriendo en el contenedor | `apt-get install -y openssh-server && systemctl enable --now ssh` |
+| `Host key verification failed` | El contenedor se recreó y su host key cambió | Borrá la entrada vieja: `ssh-keygen -R IP_LXC` |
 
 ### 2. Provisionar go2rtc (script interactivo)
 
@@ -283,8 +327,17 @@ Los archivos corresponden **exactamente** a la versión:
 
 `frontend/public/go2rtc/VERSION.txt` guarda el tag y los hashes `sha256`.
 **Mantener estos archivos en sincronía** con la versión de go2rtc instalada en el LXC:
-el provisioner instala la última release, así que si el LXC no es `v1.9.14`, re-copiá
-`video-rtc.js` y `video-stream.js` desde el tag instalado y actualizá `VERSION.txt`.
+el provisioner **fija `v1.9.14`** (no descarga la última release) y baja el binario
+desde ese tag exacto. Para mover la versión hay que ser explícito:
+
+```bash
+# --upgrade fuerza la re-descarga con el tag pedido
+ssh -t root@IP_LXC 'bash /root/deploy/install-lxc.sh --upgrade --go2rtc-version v1.9.15'
+```
+
+También se puede fijar con `GO2RTC_VERSION=v1.9.15` por entorno. Al pedir otro tag,
+el script **avisa** que hay que re-copiar `video-rtc.js` y `video-stream.js` desde
+ese tag y actualizar `VERSION.txt`.
 La versión instalada aparece en los primeros renglones del log del servicio
 (`journalctl -u go2rtc -n 20 --no-pager`).
 
