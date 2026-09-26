@@ -328,3 +328,17 @@ Parámetro: `IP_LXC` (y usuario SSH).
 | §3.2 (next-steps) | El script dejaba instrucciones de editar el YAML y reiniciar | El script reporta éxito (URL + próximo paso) o fallo (comando de logs + rollback) por sí mismo | D6 · S3 |
 
 **Sin reconciliación pendiente en este plan.** Los apartados de arriba son los únicos desvíos registrados (filas 1–21 del design); el resto del plan se cumplió tal cual.
+
+---
+
+## Apéndice de reconciliación (cierre SDD `pipeline-publicacion`, 2026-09-26)
+
+> Agregado al archivar el cambio. **No reescribe el plan ni renombra sus fases**: es el documento original del dueño y se conserva. El plan (§9, Fase 7) describe el despliegue como un build local + copia manual; el cambio `pipeline-publicacion` agrega, **además**, un pipeline automático. Nada del plan se contradice: el camino manual queda como **fallback documentado**.
+
+| § plan | El plan dice | Ahora además existe | Por qué / dónde |
+|---|---|---|---|
+| §9 (Fase 7) | Build local (`npm ci` + `ng build`) y `rsync --delete` a `/opt/visor-camaras/www` | Camino normal: `git push` a `main` → CI `verify` → job `publish` a la rama `frontend-dist` → el contenedor baja el artefacto por HTTPS y lo activa con un `rename(2)` (timer de 30 min) | `.github/workflows/ci.yml`, `deploy/visor-camaras-update.sh` + units; `deploy-frontend.sh` sigue existiendo como fallback |
+| §2 / §3.2 | Estructura de `deploy/` con 4 archivos | Se suman `.github/workflows/ci.yml`, `deploy/manifest.sh`, `deploy/check-artifact.sh`, `deploy/visor-camaras-update.sh`/`.service`/`.timer`, `frontend/.nvmrc` y harnesses en `deploy/tests/` | El provisioner sigue siendo el único dueño; instala también el updater, su helper y el timer |
+| §3.2.4 | Crear `/opt/visor-camaras/www/` como directorio | `www` es un **symlink** a `releases/<id>`; el provisioner migra el `www` real legacy una sola vez, **atendido** | P-D15/P-D17 del design del cambio |
+
+Contrato del cambio: `sdd/pipeline-publicacion/spec` (9 requisitos, 15 escenarios, **100 % aditivo**: nada MODIFIED ni REMOVED). Decisiones completas en `sdd/pipeline-publicacion/design` (P-D1..P-D27; P-D9 quedó corregido a Node `22.22.2`, el valor autoritativo de `frontend/.nvmrc`); detalle end-to-end en `sdd/pipeline-publicacion/archive-report`.

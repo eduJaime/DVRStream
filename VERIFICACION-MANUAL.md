@@ -305,5 +305,8 @@ actualizar, el repo tiene que haber publicado al menos una vez (rama
 ## Fuera de alcance de este gate
 
 - Lo cubierto por `npx ng test --watch=false` y `npx ng build --configuration production`.
-- `shellcheck` del provisioner: no está instalado en el entorno de desarrollo;
-  corrélo en el LXC/CI si está disponible (`shellcheck -S warning deploy/install-lxc.sh`).
+- `shellcheck` sobre `deploy/`: **ya no está fuera de alcance**. Está instalado en
+  desarrollo (0.11.0) y CI lo corre en cada push (0.9.0, la de ubuntu-24.04). Local:
+  `shellcheck -S warning deploy/*.sh deploy/tests/*.sh`. Cuidado con la versión: la
+  0.9.0 reporta hallazgos que la 0.11.0 no ve (ya pasó con SC2120), así que un verde
+  local **no** garantiza verde en CI.
