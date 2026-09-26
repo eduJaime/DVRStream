@@ -777,6 +777,11 @@ seed_initial_release() {
 # recién ahí el symlink a www. Cualquier fallo anterior al rename final deja www
 # intacto; un fallo del rename final intenta restaurar www desde el release.
 # Reversión: rm www && mv releases/<id> www.
+# El argumento opcional no se usa en este archivo, pero sí en el harness
+# (deploy/tests/install-lxc.test.sh), que pasa un id fijo para que el nombre del
+# release sea determinista. ShellCheck no cruza archivos, así que SC2120 es un
+# falso positivo acá. Detectado por la versión 0.9.0 de CI; la 0.11.0 local no lo marca.
+# shellcheck disable=SC2120
 migrate_legacy_www() {
   local id="${1:-}" dest tmp
   [[ -n "${id}" ]] || id="legacy-$(date -u +%Y%m%dT%H%M%SZ)"
