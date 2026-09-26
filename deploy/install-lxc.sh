@@ -3,9 +3,11 @@
 # install-lxc.sh -- Provisioner interactivo de go2rtc para el visor de cámaras.
 #
 # Un solo script (D7): instala dependencias, binario, usuario de sistema,
-# directorios, unidad systemd y renderiza /etc/go2rtc/go2rtc.yaml a partir de
-# prompts (o flags/env para runs desatendidos). Supersede el comportamiento
-# no-interactivo anterior: no queda nada por editar a mano.
+# directorios, unidad systemd, renderiza /etc/go2rtc/go2rtc.yaml a partir de
+# prompts (o flags/env para runs desatendidos), instala el updater del frontend
+# con su helper y sus units, deja el layout releases/ + symlink www (migrando
+# atendido el www legacy) y habilita el timer de auto-update. Supersede el
+# comportamiento no-interactivo anterior: no queda nada por editar a mano.
 #
 # Pensado para un LXC Debian 12 nativo (sin Docker). IDEMPOTENTE: volver a
 # correrlo es la forma soportada de rotar credenciales o cambiar rutas.
@@ -45,10 +47,22 @@ BIN_PATH="/usr/local/bin/go2rtc"
 CONFIG_DIR="/etc/go2rtc"
 CONFIG_PATH="${CONFIG_DIR}/go2rtc.yaml"
 PREV_PATH="${CONFIG_PATH}.prev"
-WWW_DIR="/opt/visor-camaras/www"
+WWW_BASE_DIR="/opt/visor-camaras"
+WWW_DIR="${WWW_BASE_DIR}/www"
+RELEASES_DIR="${WWW_BASE_DIR}/releases"
 SERVICE_NAME="go2rtc"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 RUN_USER="go2rtc"
+# Updater del frontend publicado (PR3–PR5): el provisioner es el único que lo
+# instala y el único que migra el layout legacy (P-D17), nunca el timer.
+UPDATE_UNIT="visor-camaras-update"
+UPDATE_BIN_PATH="/usr/local/sbin/visor-camaras-update"
+MANIFEST_LIB_DIR="/usr/local/lib/visor-camaras"
+MANIFEST_HELPER_PATH="${MANIFEST_LIB_DIR}/manifest.sh"
+UPDATE_SERVICE_PATH="/etc/systemd/system/${UPDATE_UNIT}.service"
+UPDATE_TIMER_PATH="/etc/systemd/system/${UPDATE_UNIT}.timer"
+# Se completa si esta corrida migró un www real (el resumen lo reporta).
+MIGRATED_LEGACY_DEST=""
 # Versión fijada: la misma del reproductor vendorizado en el front
 # (frontend/public/go2rtc/VERSION.txt). Nunca se descarga `latest`.
 GO2RTC_VERSION_PINNED="v1.9.14"
@@ -379,7 +393,8 @@ usage() {
 Uso: $0 [opciones]
 
 Provisiona go2rtc dentro del LXC: instala el binario, crea usuario y
-directorios, renderiza /etc/go2rtc/go2rtc.yaml y deja el servicio activo.
+directorios, renderiza /etc/go2rtc/go2rtc.yaml, instala el updater del
+frontend (releases/ + symlink www, timer cada 30 min) y deja el servicio activo.
 
 Opciones:
   --address IP              dirección publicada del LXC (default: detectada)
@@ -501,8 +516,11 @@ phase_user_dirs() {
             --gecos "go2rtc service" "${RUN_USER}"
   fi
   install -d -m 0755 "${CONFIG_DIR}"
-  install -d -m 0755 "${WWW_DIR}"
-  chown "${RUN_USER}:${RUN_USER}" "${CONFIG_DIR}" "${WWW_DIR}"
+  # www ya no se crea acá: el layout lo define ensure_www_layout() (symlink a
+  # releases/ o migración atendida del directorio real legacy).
+  install -d -m 0755 "${WWW_BASE_DIR}"
+  install -d -m 0755 "${RELEASES_DIR}"
+  chown "${RUN_USER}:${RUN_USER}" "${CONFIG_DIR}" "${WWW_BASE_DIR}" "${RELEASES_DIR}"
   log 'Directorios listos.'
 }
 
@@ -608,6 +626,7 @@ print_summary() {
   printf '  DVR:        %s\n' "${DVR_HOST}"
   printf '  Usuario:    %s\n' "${DVR_USER}"
   printf '  Contraseña: ********\n'
+  printf '  Layout:     %s\n' "$(layout_summary_line)"
   local i
   for i in 0 1 2 3; do
     printf '  Canal %d:    %s\n' "$((i + 1))" "$(build_rtsp_url_masked "${CHANNEL_PATHS[i]}")"
@@ -684,11 +703,184 @@ install_service_unit() { # fase 8
   systemctl enable "${SERVICE_NAME}" >/dev/null
 }
 
+# --- Updater del frontend (PR5) ------------------------------------------------
+
+# install_file_if_changed <origen> <destino> <modo>: copia sólo si el destino
+# difiere (cmp -s), crea el directorio padre y fija root:root. El chown va
+# aparte del install para poder testear la copia real sin root (mismo patrón
+# que write_config_atomic con el chown stubbeado).
+install_file_if_changed() {
+  local src="$1" dest="$2" mode="$3" dir
+  [[ -f "${src}" ]] || fatal "falta ${src}"
+  if [[ -f "${dest}" ]] && cmp -s -- "${src}" "${dest}"; then
+    log "sin cambios: ${dest}"
+    return 0
+  fi
+  dir="$(dirname -- "${dest}")"
+  install -d -m 0755 -- "${dir}" || fatal "no se pudo crear ${dir}"
+  install -m "${mode}" -- "${src}" "${dest}" \
+    || fatal "no se pudo instalar ${src} en ${dest}"
+  chown root:root -- "${dest}" || warn "no se pudo fijar root:root en ${dest}"
+  log "instalado: ${dest} (${mode})"
+}
+
+# install_update_program: updater a /usr/local/sbin (0755) y manifest.sh al
+# directorio de librerías (0644). El updater busca el helper en SCRIPT_DIR,
+# /usr/local/lib/visor-camaras/ y /usr/local/sbin/ (load_manifest_helper), así
+# que instalarlo ahí lo deja resoluble sin más.
+install_update_program() {
+  install_file_if_changed "${SCRIPT_DIR}/visor-camaras-update.sh" "${UPDATE_BIN_PATH}" 0755
+  install_file_if_changed "${SCRIPT_DIR}/manifest.sh" "${MANIFEST_HELPER_PATH}" 0644
+}
+
+# install_update_units: unidades del updater con el patrón idempotente del
+# instalador (cmp -s + install -m 0644 + daemon-reload sólo si cambió alguna).
+install_update_units() {
+  local changed=0 pair src dest dir
+  for pair in "${SCRIPT_DIR}/visor-camaras-update.service:${UPDATE_SERVICE_PATH}" \
+              "${SCRIPT_DIR}/visor-camaras-update.timer:${UPDATE_TIMER_PATH}"; do
+    src="${pair%%:*}"
+    dest="${pair#*:}"
+    if [[ -f "${dest}" ]] && cmp -s -- "${src}" "${dest}"; then
+      log "sin cambios: ${dest}"
+      continue
+    fi
+    dir="$(dirname -- "${dest}")"
+    install -d -m 0755 -- "${dir}" || fatal "no se pudo crear ${dir}"
+    install -m 0644 -- "${src}" "${dest}" \
+      || fatal "no se pudo instalar ${src} en ${dest}"
+    chown root:root -- "${dest}" || warn "no se pudo fijar root:root en ${dest}"
+    log "instalado: ${dest} (0644)"
+    changed=1
+  done
+  if (( changed )); then
+    systemctl daemon-reload
+    log 'daemon-reload: unidades del updater actualizadas.'
+  fi
+}
+
+# seed_initial_release: release vacío inicial para que www apunte a un
+# directorio real desde el arranque (go2rtc sirve 404 hasta el primer update;
+# el updater puede snapshottearlo y activar sobre él sin casos especiales).
+seed_initial_release() {
+  local initial="${RELEASES_DIR}/initial"
+  install -d -m 0755 -- "${initial}" \
+    || fatal "no se pudo crear ${initial}"
+  chown "${RUN_USER}:${RUN_USER}" "${initial}" \
+    || warn "no se pudo fijar ${RUN_USER} en ${initial}"
+}
+
+# migrate_legacy_www [<id>]: migración ATENDIDA del layout legacy (P-D17): www
+# es un directorio real -> releases/<id> (rename same-fs) + symlink relativo.
+# Nunca la hace el timer. Orden a prueba de pérdida: primero se prepara el
+# symlink en www.migrate, después se renombra el directorio real al release y
+# recién ahí el symlink a www. Cualquier fallo anterior al rename final deja www
+# intacto; un fallo del rename final intenta restaurar www desde el release.
+# Reversión: rm www && mv releases/<id> www.
+migrate_legacy_www() {
+  local id="${1:-}" dest tmp
+  [[ -n "${id}" ]] || id="legacy-$(date -u +%Y%m%dT%H%M%SZ)"
+  dest="${RELEASES_DIR}/${id}"
+  tmp="${WWW_DIR}.migrate"
+  install -d -m 0755 -- "${RELEASES_DIR}" \
+    || fatal "migración: no se pudo preparar ${RELEASES_DIR}; el sitio quedó intacto"
+  [[ ! -e "${dest}" ]] \
+    || fatal "migración: ya existe ${dest}; resolvelo a mano antes de seguir"
+  warn "migración atendida: ${WWW_DIR} es un directorio real; se moverá a releases/${id}"
+  rm -f -- "${tmp}" || fatal "migración: no se pudo limpiar ${tmp}; el sitio quedó intacto"
+  ln -s -- "releases/${id}" "${tmp}" \
+    || fatal "migración: no se pudo preparar el symlink ${tmp}; el sitio quedó intacto"
+  if ! mv -T -- "${WWW_DIR}" "${dest}"; then
+    rm -f -- "${tmp}" 2>/dev/null || true
+    fatal "migración: no se pudo mover ${WWW_DIR} a ${dest}; el sitio quedó intacto"
+  fi
+  if ! mv -T -- "${tmp}" "${WWW_DIR}"; then
+    rm -f -- "${tmp}" 2>/dev/null || true
+    if mv -T -- "${dest}" "${WWW_DIR}" 2>/dev/null; then
+      fatal "migración: falló el symlink; ${WWW_DIR} se restauró intacto"
+    fi
+    fatal "migración: falló el symlink; el front quedó a salvo en ${dest}"
+  fi
+  chown -R "${RUN_USER}:${RUN_USER}" "${dest}" \
+    || warn "migración: no se pudo fijar ${RUN_USER} en ${dest}"
+  chmod -R a+rX -- "${dest}" \
+    || warn "migración: no se pudieron ajustar los permisos de ${dest}"
+  MIGRATED_LEGACY_DEST="${dest}"
+  log "migración completa: ${WWW_DIR} -> releases/${id}"
+  warn "para revertirla: rm -- '${WWW_DIR}' && mv -- '${dest}' '${WWW_DIR}'"
+}
+
+# layout_summary_line: describe el estado del layout para el resumen previo a la
+# confirmación (la migración es atendida: el operador la ve antes de aplicarla).
+layout_summary_line() {
+  if [[ -L "${WWW_DIR}" ]]; then
+    if [[ -d "${WWW_DIR}/" ]]; then
+      printf 'www ya es symlink a %s: sin cambios' "$(readlink -- "${WWW_DIR}")"
+    else
+      printf 'www es un symlink que no resuelve (%s)' "$(readlink -- "${WWW_DIR}")"
+    fi
+  elif [[ -d "${WWW_DIR}" ]]; then
+    printf 'migración atendida: www (directorio real) -> releases/legacy-<ts> + symlink'
+  elif [[ -e "${WWW_DIR}" ]]; then
+    printf 'layout inesperado: %s no es directorio ni symlink' "${WWW_DIR}"
+  else
+    printf 'se creará releases/ y el symlink www -> releases/initial'
+  fi
+}
+
+# ensure_www_layout: invariante P-D17. Idempotente y re-ejecutable: no-op si www
+# ya es un symlink (con aviso si no resuelve); migración atendida si es un
+# directorio real (nunca la hace el updater); si no existe, crea releases/initial
+# y el symlink relativo. Cualquier otro estado se rechaza sin tocar nada.
+ensure_www_layout() {
+  install -d -m 0755 -- "${RELEASES_DIR}" \
+    || fatal "layout: no se pudo preparar ${RELEASES_DIR}"
+  if [[ -L "${WWW_DIR}" ]]; then
+    log "layout: ${WWW_DIR} ya es un symlink ($(readlink -- "${WWW_DIR}")); sin cambios."
+    if [[ ! -d "${WWW_DIR}/" ]]; then
+      warn 'layout: el symlink no resuelve a un directorio; el updater lo va a rechazar hasta arreglarlo.'
+    fi
+    return 0
+  fi
+  if [[ -d "${WWW_DIR}" ]]; then
+    migrate_legacy_www
+    return 0
+  fi
+  if [[ -e "${WWW_DIR}" ]]; then
+    fatal "layout inesperado: ${WWW_DIR} no es un directorio ni un symlink"
+  fi
+  seed_initial_release
+  ln -s -- 'releases/initial' "${WWW_DIR}" \
+    || fatal "layout: no se pudo crear el symlink ${WWW_DIR} -> releases/initial"
+  log "layout creado: ${WWW_DIR} -> releases/initial"
+}
+
+enable_update_timer() {
+  systemctl enable --now "${UPDATE_UNIT}.timer" >/dev/null \
+    || fatal "no se pudo habilitar ${UPDATE_UNIT}.timer"
+  log "timer del updater habilitado y arrancado (${UPDATE_UNIT}.timer, cada 30 min)"
+}
+
+# install_update_artifacts: fases PR5 de instalación (updater + helper,
+# unidades y layout/migración). NO habilita el timer: eso se hace recién
+# cuando go2rtc quedó activo y verificado (si el timer corriera con el sitio
+# caído, el updater haría rollback+cuarentena del commit publicado).
+install_update_artifacts() {
+  install_update_program
+  install_update_units
+  ensure_www_layout
+}
+
 report_success() {
   printf '\n'
   log 'Provisioning completo.'
   printf '    Config:   %s (%s:%s, 0600)\n' "${CONFIG_PATH}" "${RUN_USER}" "${RUN_USER}"
   printf '    Servicio: %s activo\n' "${SERVICE_NAME}"
+  printf '    Updater:  %s (timer %s, cada 30 min)\n' "${UPDATE_BIN_PATH}" "${UPDATE_UNIT}.timer"
+  if [[ -n "${MIGRATED_LEGACY_DEST:-}" ]]; then
+    printf '    Migración: front legacy en %s (revertir: rm %s && mv %s %s)\n' \
+      "${MIGRATED_LEGACY_DEST}" "${WWW_DIR}" "${MIGRATED_LEGACY_DEST}" "${WWW_DIR}"
+  fi
   printf '    UI:       http://%s:1984/\n' "${LXC_ADDRESS}"
   printf '    Siguiente paso (desde la PC de desarrollo): ./deploy/deploy-frontend.sh %s\n' "${LXC_ADDRESS}"
 }
@@ -717,6 +909,9 @@ restart_and_verify() { # fases 9 y 10
       curl -fsS --max-time 3 'http://127.0.0.1:1984/' >/dev/null 2>&1 \
         || warn 'La API local todavía no responde (aviso, no error).'
     fi
+    # Recién con go2rtc activo se habilita el auto-update: con el sitio caído
+    # un tick haría rollback+cuarentena del commit publicado y quedaría inerte.
+    enable_update_timer
     report_success
     exit 0
   fi
@@ -769,6 +964,7 @@ main() {
 
   write_config_atomic
   install_service_unit
+  install_update_artifacts
   restart_and_verify
 }
 

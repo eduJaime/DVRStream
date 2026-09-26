@@ -87,6 +87,10 @@ jobs:
       - name: Workflow containment harness
         run: bash deploy/tests/ci-workflow.test.sh
 
+      # Harness del updater (PR3/PR4) gateado por CI (OQ7); no toca red ni root.
+      - name: Updater harness
+        run: bash deploy/tests/update-frontend.test.sh
+
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
 

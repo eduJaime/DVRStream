@@ -595,4 +595,263 @@ assert_contains "UI con la IP publicada" "${OUT}" 'http://10.0.0.9:1984/'
 assert_contains "siguiente paso" "${OUT}" './deploy/deploy-frontend.sh 10.0.0.9'
 assert_eq "sin ruido de error en stderr" "" "${ERR}"
 
+printf '\n== updater: instalación, layout y migración (PR5) ==\n'
+
+# No root: systemctl se stubea y registra cada llamada (chown ya quedó stubbeado
+# arriba). La copia real con `install`/`cmp`/`mv`/`ln` corre contra el sandbox.
+SYSTEMCTL_LOG="${WORK_DIR}/systemctl.log"
+: > "${SYSTEMCTL_LOG}"
+SYSTEMCTL_ACTIVE=1
+systemctl() {
+  printf '%s\n' "$*" >> "${SYSTEMCTL_LOG}"
+  if [[ "$1" == "is-active" && "${SYSTEMCTL_ACTIVE}" == "0" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+snapshot_tree() { # <dir> -> tipo, modo, ruta y destino de symlink, ordenado
+  ( cd -- "$1" && find . -mindepth 1 -printf '%y %m %p -> %l\n' | LC_ALL=C sort )
+}
+
+set_layout_paths() { # <base>
+  WWW_BASE_DIR="$1"
+  WWW_DIR="${WWW_BASE_DIR}/www"
+  RELEASES_DIR="${WWW_BASE_DIR}/releases"
+}
+
+if ! declare -F ensure_www_layout >/dev/null; then
+  printf 'FAIL: install-lxc.sh no expone ensure_www_layout() (PR5)\n' >&2
+  exit 1
+fi
+if ! declare -F install_update_artifacts >/dev/null; then
+  printf 'FAIL: install-lxc.sh no expone install_update_artifacts() (PR5)\n' >&2
+  exit 1
+fi
+
+DEPLOY_DIR="$(cd -- "${TEST_DIR}/.." && pwd)"
+PR5="${WORK_DIR}/pr5"
+mkdir -p "${PR5}/base"
+set_layout_paths "${PR5}/base"
+UPDATE_BIN_PATH="${PR5}/sbin-local/visor-camaras-update"
+MANIFEST_LIB_DIR="${PR5}/lib-local/visor-camaras"
+MANIFEST_HELPER_PATH="${MANIFEST_LIB_DIR}/manifest.sh"
+UPDATE_SERVICE_PATH="${PR5}/systemd/visor-camaras-update.service"
+UPDATE_TIMER_PATH="${PR5}/systemd/visor-camaras-update.timer"
+
+begin "install_update_program instala el updater (0755) y el helper (0644)"
+run_capture install_update_program
+assert_eq "exit 0" "0" "${RC}"
+assert_contains "log de instalación del updater" "${OUT}" "instalado: ${UPDATE_BIN_PATH} (0755)"
+assert_contains "log de instalación del helper" "${OUT}" "instalado: ${MANIFEST_HELPER_PATH} (0644)"
+run_capture cmp -s -- "${DEPLOY_DIR}/visor-camaras-update.sh" "${UPDATE_BIN_PATH}"
+assert_eq "updater idéntico a la fuente" "0" "${RC}"
+run_capture cmp -s -- "${DEPLOY_DIR}/manifest.sh" "${MANIFEST_HELPER_PATH}"
+assert_eq "helper idéntico a la fuente" "0" "${RC}"
+assert_eq "modo updater" "755" "$(stat -c '%a' -- "${UPDATE_BIN_PATH}")"
+assert_eq "modo helper" "644" "$(stat -c '%a' -- "${MANIFEST_HELPER_PATH}")"
+
+begin "install_update_program es idempotente (cmp -s) y repara un destino alterado"
+run_capture install_update_program
+assert_eq "segundo run exit 0" "0" "${RC}"
+assert_contains "updater sin cambios" "${OUT}" "sin cambios: ${UPDATE_BIN_PATH}"
+assert_contains "helper sin cambios" "${OUT}" "sin cambios: ${MANIFEST_HELPER_PATH}"
+printf 'alterado\n' > "${UPDATE_BIN_PATH}"
+run_capture install_update_program
+assert_eq "tercer run exit 0" "0" "${RC}"
+assert_contains "reinstala lo alterado" "${OUT}" "instalado: ${UPDATE_BIN_PATH}"
+run_capture cmp -s -- "${DEPLOY_DIR}/visor-camaras-update.sh" "${UPDATE_BIN_PATH}"
+assert_eq "contenido reparado" "0" "${RC}"
+
+begin "install_update_units instala service y timer con un solo daemon-reload"
+: > "${SYSTEMCTL_LOG}"
+run_capture install_update_units
+assert_eq "exit 0" "0" "${RC}"
+assert_contains "log de unidades" "${OUT}" 'unidades del updater actualizadas'
+run_capture cmp -s -- "${DEPLOY_DIR}/visor-camaras-update.service" "${UPDATE_SERVICE_PATH}"
+assert_eq "service copiado" "0" "${RC}"
+run_capture cmp -s -- "${DEPLOY_DIR}/visor-camaras-update.timer" "${UPDATE_TIMER_PATH}"
+assert_eq "timer copiado" "0" "${RC}"
+assert_eq "modo service" "644" "$(stat -c '%a' -- "${UPDATE_SERVICE_PATH}")"
+assert_eq "modo timer" "644" "$(stat -c '%a' -- "${UPDATE_TIMER_PATH}")"
+assert_eq "un daemon-reload" "1" "$(grep -c 'daemon-reload' "${SYSTEMCTL_LOG}" || true)"
+
+begin "install_update_units es idempotente y sólo recarga si una unidad cambia"
+run_capture install_update_units
+assert_eq "exit 0" "0" "${RC}"
+assert_contains "service sin cambios" "${OUT}" "sin cambios: ${UPDATE_SERVICE_PATH}"
+assert_eq "sin daemon-reload extra" "1" "$(grep -c 'daemon-reload' "${SYSTEMCTL_LOG}" || true)"
+printf '# unidad alterada\n' > "${UPDATE_TIMER_PATH}"
+run_capture install_update_units
+assert_eq "exit 0" "0" "${RC}"
+assert_eq "segunda recarga" "2" "$(grep -c 'daemon-reload' "${SYSTEMCTL_LOG}" || true)"
+run_capture cmp -s -- "${DEPLOY_DIR}/visor-camaras-update.timer" "${UPDATE_TIMER_PATH}"
+assert_eq "timer reparado" "0" "${RC}"
+
+begin "enable_update_timer habilita y arranca el timer (enable --now)"
+: > "${SYSTEMCTL_LOG}"
+run_capture enable_update_timer
+assert_eq "exit 0" "0" "${RC}"
+assert_contains "enable --now del timer" "$(<"${SYSTEMCTL_LOG}")" \
+  'enable --now visor-camaras-update.timer'
+
+begin "ensure_www_layout fresco: releases/initial + www -> releases/initial"
+assert_eq "www ausente antes" "0" "$([[ -e "${WWW_DIR}" ]] && echo 1 || echo 0)"
+run_capture ensure_www_layout
+assert_eq "exit 0" "0" "${RC}"
+assert_eq "www es symlink" "1" "$([[ -L "${WWW_DIR}" ]] && echo 1 || echo 0)"
+assert_eq "target relativo" "releases/initial" "$(readlink -- "${WWW_DIR}")"
+assert_eq "initial existe y es directorio" "1" "$([[ -d "${RELEASES_DIR}/initial" ]] && echo 1 || echo 0)"
+assert_eq "modo initial" "755" "$(stat -c '%a' -- "${RELEASES_DIR}/initial")"
+assert_contains "log del layout nuevo" "${OUT}" 'www -> releases/initial'
+
+begin "ensure_www_layout es no-op cuando www ya es un symlink"
+snap_before="$(snapshot_tree "${WWW_BASE_DIR}")"
+run_capture ensure_www_layout
+assert_eq "exit 0" "0" "${RC}"
+assert_contains "sin cambios" "${OUT}" 'sin cambios'
+snap_after="$(snapshot_tree "${WWW_BASE_DIR}")"
+assert_eq "árbol idéntico tras el re-run" "${snap_before}" "${snap_after}"
+
+begin "ensure_www_layout avisa pero no toca un symlink que no resuelve"
+rm -f -- "${WWW_DIR}"
+ln -s -- 'releases/no-existe' "${WWW_DIR}"
+run_capture ensure_www_layout
+assert_eq "exit 0" "0" "${RC}"
+assert_contains "aviso de symlink sin resolver" "${ERR}" 'no resuelve'
+assert_eq "symlink intacto" "releases/no-existe" "$(readlink -- "${WWW_DIR}")"
+rm -f -- "${WWW_DIR}"
+
+begin "ensure_www_layout rechaza un www que no es directorio ni symlink"
+FRESH_FILE="${WORK_DIR}/pr5-file"
+mkdir -p "${FRESH_FILE}/base"
+set_layout_paths "${FRESH_FILE}/base"
+printf 'plano\n' > "${WWW_DIR}"
+run_capture ensure_www_layout
+assert_eq "exit 1" "1" "${RC}"
+assert_contains "layout inesperado" "${ERR}" 'layout inesperado'
+assert_eq "archivo intacto" 'plano' "$(<"${WWW_DIR}")"
+
+begin "ensure_www_layout fresco falla sin crear www si no puede preparar releases/"
+FRESH_RO="${WORK_DIR}/pr5-ro"
+mkdir -p "${FRESH_RO}/base"
+chmod 500 "${FRESH_RO}/base"
+set_layout_paths "${FRESH_RO}/base"
+run_capture ensure_www_layout
+assert_eq "exit 1" "1" "${RC}"
+assert_contains "no se pudo preparar" "${ERR}" 'no se pudo preparar'
+assert_eq "www no creado" "0" "$([[ -e "${WWW_DIR}" ]] && echo 1 || echo 0)"
+chmod 755 "${FRESH_RO}/base"
+
+MIG="${WORK_DIR}/pr5-mig"
+mkdir -p "${MIG}/base/www/sub"
+printf '<html>front viejo</html>\n' > "${MIG}/base/www/index.html"
+printf 'chunk viejo\n' > "${MIG}/base/www/sub/app-abc123.js"
+set_layout_paths "${MIG}/base"
+sha_before="$(cd -- "${MIG}/base/www" && sha256sum index.html sub/app-abc123.js | LC_ALL=C sort)"
+
+begin "migración atendida: www real -> releases/legacy-<ts>, contenido intacto y servido"
+run_capture ensure_www_layout
+assert_eq "exit 0" "0" "${RC}"
+assert_eq "www ahora es symlink" "1" "$([[ -L "${WWW_DIR}" ]] && echo 1 || echo 0)"
+mig_target="$(readlink -- "${WWW_DIR}")"
+assert_contains "target bajo releases" "${mig_target}" 'releases/legacy-'
+assert_eq "un solo legacy-*" "1" \
+  "$(find "${RELEASES_DIR}" -mindepth 1 -maxdepth 1 -name 'legacy-*' | wc -l | tr -d ' ')"
+assert_eq "index servido por www" '<html>front viejo</html>' "$(<"${WWW_DIR}/index.html")"
+assert_eq "chunk servido por www" 'chunk viejo' "$(<"${WWW_DIR}/sub/app-abc123.js")"
+sha_after="$(cd -- "${WWW_DIR}" && sha256sum index.html sub/app-abc123.js | LC_ALL=C sort)"
+assert_eq "hashes intactos" "${sha_before}" "${sha_after}"
+assert_contains "log de migración completa" "${OUT}" 'migración completa'
+assert_contains "log con el release destino" "${OUT}" "${mig_target}"
+assert_contains "reversión documentada" "${ERR}" 'para revertirla: rm --'
+
+begin "la migración es idempotente: el re-run no cambia nada"
+snap_before="$(snapshot_tree "${MIG}/base")"
+run_capture ensure_www_layout
+assert_eq "exit 0" "0" "${RC}"
+assert_eq "mismo target" "${mig_target}" "$(readlink -- "${WWW_DIR}")"
+assert_eq "sigue habiendo un solo legacy-*" "1" \
+  "$(find "${RELEASES_DIR}" -mindepth 1 -maxdepth 1 -name 'legacy-*' | wc -l | tr -d ' ')"
+snap_after="$(snapshot_tree "${MIG}/base")"
+assert_eq "árbol idéntico tras el re-run" "${snap_before}" "${snap_after}"
+
+begin "migrate_legacy_www con id explícito falla si el destino ya existe, sin tocar www"
+MIG2="${WORK_DIR}/pr5-mig2"
+mkdir -p "${MIG2}/base/www" "${MIG2}/base/releases/legacy-fixed"
+printf 'contenido vivo\n' > "${MIG2}/base/www/index.html"
+printf 'keep\n' > "${MIG2}/base/releases/legacy-fixed/keep"
+set_layout_paths "${MIG2}/base"
+run_capture migrate_legacy_www 'legacy-fixed'
+assert_eq "exit 1" "1" "${RC}"
+assert_contains "destino ya existe" "${ERR}" 'ya existe'
+assert_eq "www sigue siendo directorio real" "1" \
+  "$([[ -d "${WWW_DIR}" && ! -L "${WWW_DIR}" ]] && echo 1 || echo 0)"
+assert_eq "contenido intacto" 'contenido vivo' "$(<"${WWW_DIR}/index.html")"
+assert_eq "sin symlink temporal" "0" "$([[ -e "${WWW_DIR}.migrate" ]] && echo 1 || echo 0)"
+
+begin "migrate_legacy_www falla antes de mover: www intacto y sin release parcial"
+MIG3="${WORK_DIR}/pr5-mig3"
+mkdir -p "${MIG3}/base/www" "${MIG3}/base/releases" "${MIG3}/base/www.migrate/bloqueo"
+printf 'vivo\n' > "${MIG3}/base/www/index.html"
+set_layout_paths "${MIG3}/base"
+run_capture migrate_legacy_www 'legacy-x'
+assert_eq "exit 1" "1" "${RC}"
+assert_contains "aborta antes de mover" "${ERR}" 'quedó intacto'
+assert_eq "www sigue siendo directorio real" "1" \
+  "$([[ -d "${WWW_DIR}" && ! -L "${WWW_DIR}" ]] && echo 1 || echo 0)"
+assert_eq "contenido intacto" 'vivo' "$(<"${WWW_DIR}/index.html")"
+assert_eq "sin release parcial" "0" "$([[ -e "${RELEASES_DIR}/legacy-x" ]] && echo 1 || echo 0)"
+
+begin "layout_summary_line describe el layout antes de confirmar"
+FRESH_SUM="${WORK_DIR}/pr5-sum"
+mkdir -p "${FRESH_SUM}/base"
+set_layout_paths "${FRESH_SUM}/base"
+assert_contains "fresco: crea releases/" "$(layout_summary_line)" 'se creará releases/'
+assert_contains "fresco: symlink a initial" "$(layout_summary_line)" 'releases/initial'
+set_layout_paths "${MIG3}/base"
+assert_contains "migración pendiente" "$(layout_summary_line)" 'migración atendida'
+assert_contains "destino legacy" "$(layout_summary_line)" 'releases/legacy-<ts>'
+set_layout_paths "${MIG}/base"
+assert_contains "symlink existente" "$(layout_summary_line)" 'ya es symlink a releases/legacy-'
+
+begin "install_update_artifacts: alta completa y re-run idéntico (idempotencia)"
+SUP="${WORK_DIR}/pr5-support"
+mkdir -p "${SUP}/base"
+set_layout_paths "${SUP}/base"
+UPDATE_BIN_PATH="${SUP}/sbin-local/visor-camaras-update"
+MANIFEST_LIB_DIR="${SUP}/lib-local/visor-camaras"
+MANIFEST_HELPER_PATH="${MANIFEST_LIB_DIR}/manifest.sh"
+UPDATE_SERVICE_PATH="${SUP}/systemd/visor-camaras-update.service"
+UPDATE_TIMER_PATH="${SUP}/systemd/visor-camaras-update.timer"
+: > "${SYSTEMCTL_LOG}"
+run_capture install_update_artifacts
+assert_eq "run 1 exit 0" "0" "${RC}"
+assert_eq "layout fresco creado" "releases/initial" "$(readlink -- "${WWW_DIR}")"
+assert_not_contains "no habilita el timer por sí solo" "$(<"${SYSTEMCTL_LOG}")" 'enable --now'
+snap1="$(snapshot_tree "${SUP}")"
+reloads1="$(grep -c 'daemon-reload' "${SYSTEMCTL_LOG}" || true)"
+run_capture install_update_artifacts
+assert_eq "run 2 exit 0" "0" "${RC}"
+snap2="$(snapshot_tree "${SUP}")"
+assert_eq "run 2 no cambia el árbol" "${snap1}" "${snap2}"
+assert_eq "run 2 sin daemon-reload" "${reloads1}" "$(grep -c 'daemon-reload' "${SYSTEMCTL_LOG}" || true)"
+assert_contains "run 2 reporta sin cambios" "${OUT}" 'sin cambios'
+
+begin "restart_and_verify habilita el timer recién con go2rtc activo"
+SYSTEMCTL_ACTIVE=1
+: > "${SYSTEMCTL_LOG}"
+run_capture restart_and_verify
+assert_eq "go2rtc activo: exit 0" "0" "${RC}"
+assert_contains "enable --now tras verificar" "$(<"${SYSTEMCTL_LOG}")" \
+  'enable --now visor-camaras-update.timer'
+
+begin "restart_and_verify NO habilita el timer si go2rtc no queda activo"
+SYSTEMCTL_ACTIVE=0
+: > "${SYSTEMCTL_LOG}"
+run_capture restart_and_verify
+assert_eq "go2rtc caído: exit 1" "1" "${RC}"
+assert_not_contains "sin enable --now" "$(<"${SYSTEMCTL_LOG}")" 'enable --now'
+SYSTEMCTL_ACTIVE=1
+
 printf '\n\033[1;32mOK\033[0m: %d assertions pasaron.\n' "${CASES}"
