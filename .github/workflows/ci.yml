@@ -91,6 +91,11 @@ jobs:
       - name: Updater harness
         run: bash deploy/tests/update-frontend.test.sh
 
+      # Contrato del fallback manual (PR6): escribe a través del symlink del
+      # destino y ajusta el dueño atravesándolo; no toca red ni root.
+      - name: Frontend fallback harness
+        run: bash deploy/tests/deploy-frontend.test.sh
+
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
 

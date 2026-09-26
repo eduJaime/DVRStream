@@ -49,12 +49,20 @@ fi
   || die "No se encontró un build válido (index.html) dentro de ${FRONT_DIR}/dist"
 
 log "Publicando en ${SSH_USER}@${IP_LXC}:${DEST_DIR} ..."
-rsync -az --delete -e "ssh -p ${SSH_PORT}" \
+# ${DEST_DIR} es un symlink a releases/<id> que administra visor-camaras-update
+# (swap atómico). --keep-dirlinks (-K) hace que rsync escriba A TRAVES de ese
+# symlink; sin la bandera, rsync puede reemplazar dirlinks del destino por
+# directorios reales y romper el layout del que depende el updater (P-D7).
+rsync -az --keep-dirlinks --delete -e "ssh -p ${SSH_PORT}" \
       "${BROWSER_DIR}/" "${SSH_USER}@${IP_LXC}:${DEST_DIR}/"
 
 log "Ajustando dueño y permisos..."
+# -H: chown -R no atraviesa un symlink en la línea de comandos por defecto (-P),
+# así que sin -H solo cambiaría el dueño del symlink y el contenido servido
+# (dentro de releases/) quedaría con el dueño del usuario local. -H atraviesa el
+# symlink y ajusta el contenido real.
 ssh -p "${SSH_PORT}" "${SSH_USER}@${IP_LXC}" \
-    "${REMOTE_SUDO}chown -R go2rtc:go2rtc '${DEST_DIR}' && ${REMOTE_SUDO}chmod -R a+rX '${DEST_DIR}'"
+    "${REMOTE_SUDO}chown -RH go2rtc:go2rtc '${DEST_DIR}' && ${REMOTE_SUDO}chmod -R a+rX '${DEST_DIR}'"
 
 # Los archivos estáticos se leen desde disco en cada request:
 # no hace falta reiniciar go2rtc para publicar un front nuevo.
