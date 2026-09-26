@@ -9,8 +9,9 @@
 
 **Precondiciones**
 
-- [ ] LXC Debian 12 provisionado (`deploy/install-lxc.sh`) y front publicado
-      (`deploy/deploy-frontend.sh IP_LXC`).
+- [ ] LXC Debian 12 provisionado (`deploy/install-lxc.sh`) — el provisioner deja
+      instalados el updater y su timer — y el front publicado (por el pipeline
+      automático o con `deploy/deploy-frontend.sh IP_LXC`).
 - [ ] `http://IP_LXC:1984/` sirve la app Angular (no la UI propia de go2rtc) con las 4 cámaras.
 - [ ] Un segundo navegador/dispositivo en la LAN para las pruebas de múltiples clientes.
 - [ ] Acceso al DVR para cortar y restablecer su conectividad.
@@ -30,6 +31,7 @@
 | 7 | Touch: sin hover, grip vs swipe, 44×44, 320 px, fullscreen degradado | touch-mobile |
 | 8 | Provisioner: rotación + rollback, escritura interrumpida, fallo de servicio, secretos y run desatendido | lxc-provisioning |
 | 9 | Despliegue y control de acceso (LAN sí, fuera de la subred no; reboot del LXC) | Fase 7 del plan |
+| 10 | Pipeline automático: timer, `--status`, artefacto publicado, swap y rollback manual | pipeline-publicacion |
 
 ## 1. Reproducción de las 4 cámaras, latencia y protocolo
 
@@ -205,9 +207,94 @@ Se prueba sin root y sin tocar la config usando `--dry-run`:
 - [ ] Desde **fuera de la subred local** (datos móviles u otra VLAN), `1984/tcp` y
       `8555/tcp+udp` **no responden**.
 - [ ] Reiniciá el LXC: al volver, `systemctl is-active go2rtc` da `active` y el visor
-      funciona **sin intervención manual**.
+      funciona **sin intervención manual**; `visor-camaras-update.timer` sigue
+      `enabled` (el auto-update también se reactiva solo).
 - [ ] El repo no contiene credenciales ni IPs reales: sólo placeholders
       (`IP_LXC`, `IP_DVR`, `USUARIO`, `PASSWORD`).
+
+## 10. Publicación automática: updater, timer, artefacto y rollback
+
+Requisito: `pipeline-publicacion` (unattended-update / deploy-observability). El
+provisioner deja instalados `/usr/local/sbin/visor-camaras-update`, su helper, el
+timer de 30 minutos y el layout `www -> releases/<id>`. Para que haya algo que
+actualizar, el repo tiene que haber publicado al menos una vez (rama
+`frontend-dist`).
+
+### 10.1 El timer está activo y corre solo
+
+1. En el LXC: `systemctl status visor-camaras-update.timer` y
+   `systemctl list-timers visor-camaras-update.timer`.
+2. Forzá una corrida sin esperar: `systemctl start visor-camaras-update.service`.
+
+- [ ] El timer está `enabled` y `active (waiting)`; la próxima corrida es en
+      ≤ 30 min (más hasta 3 min de jitter). Tras un reboot se mantiene.
+- [ ] `journalctl -u visor-camaras-update.service -n 50 --no-pager` muestra la
+      corrida forzada con un resultado claro (`success`, `skipped` o el fallo),
+      sin errores de layout ni de dependencias.
+
+### 10.2 Estado: qué se está sirviendo
+
+1. `visor-camaras-update --status`.
+2. `curl -s http://IP_LXC:1984/MANIFEST.json`.
+
+- [ ] `SERVED_COMMIT` == el campo `commit` del `MANIFEST.json` servido == el commit
+      publicado en `main`.
+- [ ] Tras una activación, `ACTIVATED_COMMIT` == `SERVED_COMMIT` y
+      `LAST_OUTCOME=success`; si no había nada nuevo, `LAST_OUTCOME=skipped`.
+- [ ] `QUARANTINED_COMMIT=none` en estado sano y `SERVED_PATH` apunta a
+      `/opt/visor-camaras/releases/<UTC>-<sha7>`.
+- [ ] `cat /var/lib/visor-camaras-update/state` existe con modo `0600` y coincide
+      con lo que imprime `--status`.
+
+### 10.3 El artefacto publicado es el que se sirve
+
+1. En GitHub, el último run del workflow `CI` (badge verde) y la rama
+   `frontend-dist` (o `git ls-remote origin refs/heads/frontend-dist`).
+2. Comparar ese `MANIFEST.json` con `curl -s http://IP_LXC:1984/MANIFEST.json`.
+
+- [ ] La rama `frontend-dist` tiene **un solo commit** (se reescribe en cada
+      publicación) y su `MANIFEST.json` declara el mismo `commit` que el último run
+      verificado de `main`.
+- [ ] El `MANIFEST.json` que sirve el contenedor coincide **exactamente** con el de
+      la rama: mismo `commit` y mismo `tree_sha256`.
+- [ ] Tras un push a `main` (o al forzar el servicio), `SERVED_COMMIT` pasa al
+      commit nuevo en ≤ 30 min sin intervención manual.
+
+### 10.4 Qué esperar después de un swap
+
+1. Publicá un cambio (push a `main`) y esperá el tick, o forzalo con
+   `systemctl start visor-camaras-update.service`.
+
+- [ ] `ls -la /opt/visor-camaras/`: `www` sigue siendo un **symlink** (ahora a un
+      `releases/<UTC>-<sha7>` nuevo) y `www.prev` es un **directorio real** con el
+      contenido anterior.
+- [ ] El sitio no se cae durante el swap: recargá `http://IP_LXC:1984/` varias veces
+      y no aparece un 404/502 ni un front a medias. No hace falta reiniciar go2rtc
+      (los estáticos se leen en cada request).
+- [ ] El `MANIFEST.json` servido y `SERVED_COMMIT` ya son el commit nuevo.
+- [ ] `releases/` conserva el release servido + los 4 más nuevos (poda acotada) y
+      `www.prev` sigue existiendo como red de seguridad.
+
+### 10.5 Rollback manual y cuarentena
+
+1. `visor-camaras-update --rollback` (no necesita red).
+
+- [ ] `www` vuelve a `www.prev` y el sitio sirve la versión anterior.
+- [ ] `--status` muestra `LAST_OUTCOME=quarantined` y el commit revertido en
+      `QUARANTINED_COMMIT`.
+- [ ] El tick siguiente **no** re-aplica ese commit; para reintentarlo hay que
+      publicar uno nuevo o usar `visor-camaras-update --force` después de entender
+      la falla.
+- [ ] Sin `www.prev`, `--rollback` falla con exit 1 avisando que no hay a qué volver.
+
+### 10.6 El fallback manual convive con el timer
+
+- [ ] Si usás `deploy/deploy-frontend.sh` (build local), desactivá antes el timer:
+      `systemctl disable --now visor-camaras-update.timer`; si no, el próximo tick
+      re-aplica lo publicado.
+- [ ] Tras el deploy manual no queda `MANIFEST.json` (el script no lo escribe y su
+      `--delete` borra el que hubiera): reactivá el timer recién cuando quieras que
+      el pipeline retome el control.
 
 ## Registro
 

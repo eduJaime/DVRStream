@@ -382,10 +382,18 @@ cd deploy
 ./deploy-frontend.sh IP_LXC root
 ```
 
-Escribe **a través** del symlink (`rsync --keep-dirlinks`) y ajusta el dueño
-atravesándolo (`chown -RH`), así que no rompe el layout `www -> releases/<id>`
-del que depende el updater: actualiza **el release que `www` está sirviendo en
-ese momento**, no crea uno nuevo.
+Escribe **a través** del symlink y ajusta el dueño atravesándolo (`chown -RH`),
+así que no rompe el layout `www -> releases/<id>` del que depende el updater:
+actualiza **el release que `www` está sirviendo en ese momento**, no crea uno
+nuevo.
+
+> **Alcance real de `--keep-dirlinks` (evidencia, no marketing):** en la prueba
+> con rsync 3.5.0, el symlink de nivel superior (`www`) se atraviesa con **o
+> sin** `-K`. Lo que `-K` sí garantiza es que los dirlinks **anidados** del
+> release se preserven (sin la bandera, rsync los reemplaza por directorios
+> reales) y que el resultado no dependa de la versión del rsync receptor (el LXC
+> puede traer otra). Por eso la bandera queda igual: es explícita, defensiva e
+> inocua.
 
 > Ojo: el deploy manual **no escribe `MANIFEST.json`** (y `--delete` borra el que
 > hubiera). En el siguiente tick, el updater no lo verá como "sin cambios" y
