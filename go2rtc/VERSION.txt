@@ -1,0 +1,14 @@
+go2rtc v1.9.14
+https://github.com/AlexxIT/go2rtc/releases/tag/v1.9.14
+
+Los archivos de este directorio se copiaron tal cual desde ese tag exacto:
+- www/video-rtc.js
+- www/video-stream.js
+
+sha256:
+d48ce627baf7c341a92c0f5844a3c546431f9db873ff21489671aba2ecfe64fb  video-rtc.js
+86b4b69001242c3c71f9aedceabff06a6bc58155d8a0fe27970834aefc670b16  video-stream.js
+
+El provisioner (deploy/install-lxc.sh) FIJA v1.9.14 por defecto: nunca descarga
+`latest`. Si se mueve con --go2rtc-version (o GO2RTC_VERSION), re-copiá estos dos
+archivos desde el tag nuevo y actualizá la versión y los hashes de acá.
