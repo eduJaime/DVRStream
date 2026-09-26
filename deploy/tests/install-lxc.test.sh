@@ -10,6 +10,12 @@
 # segura de la contraseña, renderer del YAML y el camino --dry-run completo.
 # Corta en el primer fallo (exit 1) para mantener la salida legible.
 
+# Varias globales (CONFIG_DIR, CONFIG_PATH, PREV_PATH, LXC_ADDRESS, DVR_*,
+# CHANNEL_PATHS) no se leen en este archivo: son las entradas que consume
+# install-lxc.sh al ser sourceado. ShellCheck no cruza esa frontera, así que
+# el aviso de "variable asignada y no usada" es un falso positivo acá.
+# shellcheck disable=SC2034
+
 set -euo pipefail
 
 TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -366,6 +372,7 @@ assert_eq "URL del tag override" \
 begin "GO2RTC_VERSION del entorno pisa el tag fijado"
 env_version="$(
   export GO2RTC_VERSION='v1.9.16'
+  # shellcheck source=../install-lxc.sh
   source "${INSTALLER}"
   printf '%s' "${GO2RTC_VERSION}"
 )"
