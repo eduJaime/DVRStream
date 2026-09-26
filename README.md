@@ -1,5 +1,7 @@
 # Visor de cámaras (DVR RTSP → go2rtc → Angular)
 
+[![CI](https://github.com/eduJaime/DVRStream/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/eduJaime/DVRStream/actions/workflows/ci.yml)
+
 App web **sólo para red local** que muestra las 4 cámaras de un DVR (RTSP H.264)
 en una grilla 2x2, con vista ampliada, nombres editables, reordenamiento por
 drag & drop y snapshots JPG descargables. **Sin audio.**
@@ -35,14 +37,18 @@ DVRStream/
 ├── README.md
 ├── PLAN-visor-camaras.md
 ├── VERIFICACION-MANUAL.md     checklist de hardware real (LXC + DVR)
+├── .github/workflows/ci.yml   verify + publish del front
 ├── frontend/                  proyecto Angular
 └── deploy/
     ├── go2rtc.example.yaml    muestra de referencia (el script genera el real)
-    ├── go2rtc.service         unidad systemd
+    ├── go2rtc.service         unidad systemd de go2rtc
     ├── install-lxc.sh         provisioner interactivo (instala + configura)
-    ├── tests/
-    │   └── install-lxc.test.sh  tests sin dependencias del provisioner
-    └── deploy-frontend.sh     build + publicación del front
+    ├── visor-camaras-update.sh        updater del front en el LXC
+    ├── visor-camaras-update.{service,timer}  auto-update cada 30 min
+    ├── manifest.sh            helper de MANIFEST.json y tree_sha256
+    ├── check-artifact.sh      gate de limpieza del build
+    ├── deploy-frontend.sh     build + publicación manual (fallback)
+    └── tests/                 harnesses sin dependencias (bash deploy/tests/*.test.sh)
 ```
 
 ---
@@ -54,6 +60,11 @@ DVRStream/
 - Node.js **LTS** (probado con v22) y npm
 - `rsync` y acceso SSH al LXC (ver [acceso SSH sin contraseña](#acceso-ssh-sin-contraseña-una-sola-vez))
 - Angular CLI no hace falta instalarlo global: se usa `npx ng ...`
+
+> Para el camino normal de publicación (push → CI → contenedor) **no necesitás
+> nada de esto en tu máquina**: el build corre en CI y el contenedor baja el
+> artefacto por HTTPS. Node, `rsync` y SSH hacen falta sólo para el
+> [fallback manual](#fallback-manual-deploy-frontendsh) y el provisioner.
 
 **LXC**
 
@@ -124,6 +135,13 @@ dependencias y binario, crea el usuario `go2rtc` y los directorios, **pregunta**
 los datos del DVR, valida, renderiza `/etc/go2rtc/go2rtc.yaml` (`0600`, dueño
 `go2rtc`), instala la unidad systemd y **reinicia y verifica** el servicio.
 No hay que editar ningún archivo a mano.
+
+Además deja instalado el **auto-update del front**: el updater
+(`/usr/local/sbin/visor-camaras-update`), su helper, las unidades systemd y el
+layout `www -> releases/<id>` (si `www` era un directorio real, lo migra una vez,
+atendido). El timer de actualización se habilita **recién cuando go2rtc quedó
+verificado**. Está documentado en
+[Publicación automática del front](#publicación-automática-del-front).
 
 > `ssh` sin `-t` no asigna TTY y los prompts no pueden leer: usá `ssh -t`
 > (o entrá al contenedor y corré el script ahí).
@@ -201,19 +219,26 @@ servicio activo y verificado; **antes** de publicar el front se ve la UI propia
 de go2rtc con las 4 cámaras. Si las 4 se ven ahí, el puente RTSP → WebRTC
 funciona.
 
-### 4. Desplegar el front
+### 4. Publicar el front
+
+El camino normal es el **pipeline automático**: un push a `main` hace que CI
+verifique y publique, y que el contenedor se actualice solo (≤ 30 minutos). Está
+documentado en [Publicación automática del front](#publicación-automática-del-front).
+
+Para la primera puesta en marcha, o si el pipeline no está disponible, queda el
+**fallback manual**:
 
 ```bash
 cd deploy
 ./deploy-frontend.sh IP_LXC root
 ```
 
-Hace `npm ci`, `ng build --configuration production` y `rsync --delete` del build
-a `/opt/visor-camaras/www/`. Los estáticos se leen de disco en cada request, así
-que **no hace falta reiniciar go2rtc**.
+Hace `npm ci`, `ng build --configuration production` y un `rsync` que escribe
+**a través** del symlink `/opt/visor-camaras/www` (no lo reemplaza). Los estáticos
+se leen de disco en cada request, así que **no hace falta reiniciar go2rtc**.
 
-A partir de ahí, `http://IP_LXC:1984/` sirve la app Angular en vez de la UI de go2rtc.
-Para cerrar el despliegue, corré el checklist de hardware real:
+A partir de ahí, `http://IP_LXC:1984/` sirve la app Angular en vez de la UI de
+go2rtc. Para cerrar el despliegue, corré el checklist de hardware real:
 [`VERIFICACION-MANUAL.md`](./VERIFICACION-MANUAL.md).
 
 ### 5. Desarrollo local del front
@@ -244,6 +269,152 @@ npx ng build --configuration production
 > que el video no conectaría; además el proxy quedaría sin uso. Con `''`,
 > desarrollo y producción comparten la misma topología (mismo origen) y el
 > placeholder `IP_LXC` vive en un solo archivo.
+
+---
+
+## Publicación automática del front
+
+Un push a `main` es todo: **no hay build local ni copia manual**.
+
+```bash
+git push origin main   # CI verifica → CI publica → el contenedor se actualiza solo (≤ 30 min)
+```
+
+1. **CI verifica** (job `verify` de `.github/workflows/ci.yml`): instala con el
+   Node fijo de `frontend/.nvmrc`, corre los tests, compila en producción, pasa
+   el gate de limpieza del artefacto, los harnesses de `deploy/` y `shellcheck`.
+   El badge de arriba refleja este workflow.
+2. **CI publica** (job `publish`, sólo en push a `main` y sólo si `verify` pasó):
+   sube a la rama `frontend-dist` **exactamente** los bytes que verificó, en un
+   único commit huérfano (la rama se reescribe en cada publicación). No
+   reconstruye: mueve el artefacto verificado y re-comprueba el hash contra la
+   URL pública desde la que descarga el contenedor.
+3. **El contenedor se actualiza solo**: el timer `visor-camaras-update.timer`
+   corre cada 30 minutos; el updater baja `MANIFEST.json` y el tarball, valida
+   el `tree_sha256`, hace rollback automático si la verificación falla y activa
+   el nuevo front con un `rename(2)` (swap del symlink `www`).
+
+No hace falta Node, `rsync` ni SSH en tu máquina para nada de esto.
+
+### Inspeccionar qué se está sirviendo
+
+| Qué querés saber | Comando |
+|---|---|
+| Versión servida y último resultado | `visor-camaras-update --status` |
+| Estado completo (persistido) | `cat /var/lib/visor-camaras-update/state` |
+| Identidad de lo servido por HTTP | `curl -s http://IP_LXC:1984/MANIFEST.json` |
+| Próxima corrida del timer | `systemctl list-timers visor-camaras-update.timer` |
+| Log de la última corrida | `journalctl -u visor-camaras-update.service -n 50 --no-pager` |
+
+`--status` imprime `SERVED_COMMIT`, `ACTIVATED_COMMIT`, `QUARANTINED_COMMIT`
+(`none` si no hay), `LAST_OUTCOME`, el estado completo, `SERVED_PATH` (release al
+que apunta `www`) y `STAGED_RELEASES`. `MANIFEST.json` es la identidad de lo
+servido: `commit`, `run_id`, `node`, `built_at` y `tree_sha256`.
+
+Valores de `LAST_OUTCOME`:
+
+| Valor | Significa |
+|---|---|
+| `success` | release validado, activado y verificado |
+| `skipped` | no hay cambios respecto de lo servido |
+| `quarantined` | el commit falló y no se re-aplica solo (rollback automático o manual) |
+| `failed` | falló la corrida; el sitio quedó sirviendo la versión anterior |
+
+### Timer: desactivar, reactivar, cambiar la cadencia
+
+Viene **habilitado por defecto**: primera corrida 5 minutos después del boot y
+luego cada 30 minutos, con hasta 3 minutos de jitter y persistencia entre reinicios.
+
+```bash
+# desactivar (el sitio sigue sirviendo lo último activado; no vuelve a actualizarse sola)
+systemctl disable --now visor-camaras-update.timer
+
+# reactivar
+systemctl enable --now visor-camaras-update.timer
+
+# forzar una corrida ahora
+systemctl start visor-camaras-update.service
+
+# ver la próxima corrida
+systemctl list-timers visor-camaras-update.timer
+```
+
+Para cambiar la cadencia, editá `OnUnitActiveSec=30min` en
+`/etc/systemd/system/visor-camaras-update.timer` y recargá:
+
+```bash
+systemctl daemon-reload
+systemctl restart visor-camaras-update.timer
+```
+
+### Rollback manual y cuarentena
+
+Cuando la verificación post-activación falla, el updater **hace rollback solo**:
+devuelve `www` a `www.prev` (la copia real del sitio anterior) y cuarentena el
+commit fallado.
+
+Rollback manual (por ejemplo, si quedó sirviendo algo roto que igual pasó la
+verificación):
+
+```bash
+visor-camaras-update --rollback
+```
+
+Deja `www -> www.prev`, marca el commit servido en cuarentena y **no necesita
+red**. Si no existe `www.prev`, falla avisando que no hay a qué volver.
+
+**Qué significa la cuarentena:** un commit que hizo rollback queda en
+`QUARANTINED_COMMIT` y el updater **no lo vuelve a aplicar** en los ticks
+siguientes (si no, lo re-aplicaría cada 30 minutos). Se sale publicando un commit
+nuevo, o reintentando a conciencia con `visor-camaras-update --force` después de
+entender por qué falló.
+
+### Fallback manual: `deploy-frontend.sh`
+
+El pipeline es el camino normal; el script manual queda para cuando:
+
+- querés publicar un build local que no está en `main`;
+- GitHub Actions o la salida a `codeload.githubusercontent.com` no están disponibles;
+- necesitás publicar ya, sin esperar al timer.
+
+```bash
+cd deploy
+./deploy-frontend.sh IP_LXC root
+```
+
+Escribe **a través** del symlink (`rsync --keep-dirlinks`) y ajusta el dueño
+atravesándolo (`chown -RH`), así que no rompe el layout `www -> releases/<id>`
+del que depende el updater: actualiza **el release que `www` está sirviendo en
+ese momento**, no crea uno nuevo.
+
+> Ojo: el deploy manual **no escribe `MANIFEST.json`** (y `--delete` borra el que
+> hubiera). En el siguiente tick, el updater no lo verá como "sin cambios" y
+> re-aplicará lo publicado. Si el build manual tiene que persistir, desactivá el
+> timer primero.
+
+### Prerequisito O1: proteger `main` en GitHub
+
+La contención del force-push es **a nivel workflow** (sólo el job `publish`
+empuja, con refspec literal a `frontend-dist`), pero eso no impide que alguien
+con permiso de escritura haga `git push --force origin main` fuera de CI. El
+cierre real es una regla de protección en GitHub:
+
+1. Entrá a `https://github.com/eduJaime/DVRStream/settings/branches`
+   (Settings → Branches).
+2. **Add branch protection rule** (en la UI nueva: Settings → Rules → Rulesets).
+3. Branch name pattern: `main`.
+4. Activá **Require a pull request before merging**, **Require status checks to
+   pass before merging** (elegí el check `Verify`), **Do not allow force pushes**
+   y **Do not allow deletions**.
+
+Sin esta regla, la garantía de que un force-push nunca toca `main` queda **sólo**
+en manos del workflow: un token/run comprometido o una persona con write en el
+repo podría reescribir o borrar la historia de `main`, y CI no podría impedirlo.
+Con la regla, la protección vive en el servidor, fuera del alcance de CI.
+
+> **`frontend-dist` debe quedar SIN proteger**: el job `publish` la reescribe a
+> propósito con `git push --force` en cada publicación (un solo commit huérfano).
+> Una regla de protección ahí rompería el pipeline.
 
 ---
 
@@ -383,7 +554,7 @@ un reverse proxy con autenticación (fuera del alcance de este proyecto).
 **`http://IP_LXC:1984/` sigue mostrando la UI de go2rtc**
 
 - El front todavía no se publicó, o `api.static_dir` no apunta a `/opt/visor-camaras/www`.
-- Verificar con `ls -la /opt/visor-camaras/www/`.
+- Verificá dónde apunta el symlink y qué hay servido: `ls -la /opt/visor-camaras/` y `visor-camaras-update --status`.
 
 **La app no carga al recargar una ruta**
 
@@ -393,6 +564,15 @@ un reverse proxy con autenticación (fuera del alcance de este proyecto).
 **Cambié el front pero sigo viendo el viejo**
 
 - Recarga forzada (`Ctrl+Shift+R`). El navegador cachea los assets.
+- Confirmá qué commit sirve el contenedor: `visor-camaras-update --status`.
+
+**El contenedor no se actualiza solo**
+
+- ¿El timer sigue activo? `systemctl list-timers visor-camaras-update.timer`.
+- Mirá el resultado y el error: `visor-camaras-update --status` y
+  `journalctl -u visor-camaras-update.service -n 50 --no-pager`.
+- Si `LAST_OUTCOME=quarantined`, ese commit no se re-aplica solo: corregilo,
+  publicá un commit nuevo, o reintentá a conciencia con `visor-camaras-update --force`.
 
 **"Pantalla completa" aparece deshabilitada**
 
