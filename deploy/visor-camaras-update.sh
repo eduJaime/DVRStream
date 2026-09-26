@@ -2,31 +2,42 @@
 #
 # visor-camaras-update.sh -- actualiza el frontend publicado del visor de cámaras.
 #
-# Alcance PR3: fetch / validación / staging / estado / poda, más las unidades
-# systemd. NO activa nada: el swap atómico del symlink www, el snapshot .prev,
-# el rollback y la cuarentena son PR4 y se insertan en el seam activate_release().
-# Un run exitoso deja el release validado en releases/<UTC>-<sha7> y NO toca lo
-# que se está sirviendo.
+# Alcance PR4: fetch / validación / staging / activación atómica (swap del
+# symlink www), snapshot .prev, verificación post-swap, rollback, cuarentena,
+# estado/poda y reanudación de una activación interrumpida. `success` significa
+# ACTIVADO Y VERIFICADO: el commit publicado se sirve en www y respondió la
+# verificación; `SERVED_COMMIT`/`ACTIVATED_COMMIT` lo confirman.
 #
 # Uso:
-#   visor-camaras-update.sh [--root DIR] [--dry-run] [--status]
+#   visor-camaras-update.sh [--root DIR] [--dry-run] [--status] [--check-url URL]
+#   visor-camaras-update.sh --rollback     (operador: www -> www.prev + cuarentena)
+#   visor-camaras-update.sh --force        (ignora la cuarentena de P-D25)
 #
 # Test-only (no usar en producción):
 #   visor-camaras-update.sh --root DIR --source-url file:///ruta [--dry-run]
 #   --source-url exige --root explícito y saltea el forzado HTTPS; sirve para
 #   correr el harness en un sandbox, sin red y sin root.
 #
+# Cortes en medio de la activación: el snapshot .prev puede quedar ausente o
+# como www.prev.new parcial; www nunca se toca y la próxima corrida rehace el
+# snapshot. Tras el swap, ACTIVATION_PENDING queda persistido: si el proceso
+# muere, la próxima corrida verifica el commit pendiente y lo finaliza o hace
+# rollback; nunca se acepta en silencio un release sin verificar. El único hueco
+# residual es el lapso entre el swap y el resultado persistido, y la reanudación
+# lo cubre en el siguiente tick.
+#
 # Fases (P-D18/P-D19):
 #   0. preflight: dependencias, layout (www debe ser symlink), flock -n
 #   1. fetch del MANIFEST.json publicado (HTTPS, timeout corto)
-#   2. detección de cambios (commit publicado vs servido / ya staged)
+#   2. detección de cambios (commit servido / cuarentena / ya staged)
 #   3. fetch del tarball (HTTPS, timeouts, retry y tope de tamaño)
 #   4. extracción a .staging rechazando entradas hostiles (absolutas, .., symlinks)
 #   5. validación: index.html usable + tree_sha256 vía deploy/manifest.sh
 #   6. promoción a releases/<UTC>-<sha7> (rename en el mismo filesystem)
-#   7. [SEAM PR4] activación atómica, .prev, verificación post-swap, rollback
-#   8. poda acotada (se conservan los 5 releases más nuevos + el servido)
-#   9. estado atómico en /var/lib/visor-camaras-update/state
+#   7. snapshot .prev (copia real) + swap atómico del symlink www
+#   8. verificación post-swap (symlink + <check-url>/) y rollback con cuarentena
+#   9. poda acotada (se conservan los 5 releases más nuevos + el servido)
+#  10. estado atómico en /var/lib/visor-camaras-update/state
 #
 # Exit: 0 éxito/skip/busy · 1 fallo de ejecución · 2 artefacto o layout rechazado.
 #
@@ -47,6 +58,8 @@ MAX_TARBALL_BYTES=52428800 # 50 MiB
 CONNECT_TIMEOUT=10
 MANIFEST_MAX_TIME=15
 TARBALL_MAX_TIME=600
+CHECK_TIMEOUT=5
+CHECK_URL_DEFAULT="http://127.0.0.1:1984/"
 
 # Rutas relativas al --root (en producción ROOT=/ y quedan las del diseño).
 WWW_REL="opt/visor-camaras/www"
@@ -60,12 +73,17 @@ ROOT="/"
 ROOT_EXPLICIT=0
 DRY_RUN=0
 STATUS=0
+FORCE=0
+ROLLBACK=0
 SOURCE_URL_OVERRIDE=0
+CHECK_URL="${VISOR_CHECK_URL:-${CHECK_URL_DEFAULT}}"
 SOURCE_URL=""
 MANIFEST_URL=""
 MANIFEST_HELPER="${VISOR_MANIFEST_HELPER:-}"
 
 WWW_DIR=""
+WWW_PREV_DIR=""
+WWW_SWAP_PATH=""
 RELEASES_DIR=""
 STAGING_DIR=""
 STATE_DIR=""
@@ -76,6 +94,8 @@ RUN_TMP=""
 STAGING_ACTIVE=""
 TARBALL_FILE=""
 RELEASE_PATH=""
+VERIFY_ERROR=""
+PREV_COMMIT=""
 
 declare -A STATE_MAP=()
 
@@ -94,6 +114,8 @@ path_join() { # <relativa>
 
 resolve_paths() {
   WWW_DIR="$(path_join "${WWW_REL}")"
+  WWW_PREV_DIR="${WWW_DIR}.prev"
+  WWW_SWAP_PATH="$(dirname -- "${WWW_DIR}")/.www.swap"
   RELEASES_DIR="$(path_join "${RELEASES_REL}")"
   STAGING_DIR="$(path_join "${STAGING_REL}")"
   STATE_DIR="$(path_join "${STATE_DIR_REL}")"
@@ -107,21 +129,33 @@ print_usage() {
   cat <<EOF
 Uso: $0 [opciones]
 
-Descarga el frontend publicado, lo valida en staging y lo deja listo en
-releases/<UTC>-<sha7>. No activa nada: eso es PR4. El contenido servido
-(normalmente ${WWW_DIR}) queda intacto.
+Descarga el frontend publicado, lo valida en staging, lo promueve a
+releases/<UTC>-<sha7>, actualiza el snapshot .prev y activa www con un único
+rename(2) (swap del symlink). Después exige que <check-url> sirva el commit
+recién activado; si no, hace rollback a .prev y cuarentena el commit fallado
+(P-D25) para que el timer no lo re-aplique.
 
 Opciones:
   --root DIR         prefijo para todas las rutas gestionadas (default: /)
   --dry-run          sólo informa qué haría; no escribe ni descarga el tarball
-  --status           imprime SERVED_COMMIT/LAST_OUTCOME y el estado completo
+  --status           imprime SERVED_COMMIT/ACTIVATED_COMMIT/LAST_OUTCOME y el
+                     estado completo
+  --force            ignora la cuarentena de P-D25 y reintenta el commit
+                     publicado (sólo tras revisar por qué se hizo rollback)
+  --rollback         operador: vuelve www a www.prev (copia) y cuarentena el
+                     commit servido; no descarga nada ni requiere red
+  --check-url URL    base de la verificación post-swap (default:
+                     ${CHECK_URL_DEFAULT}); el updater exige que
+                     <URL>/MANIFEST.json sirva el commit recién activado.
   -h, --help         esta ayuda
 
 Test-only:
   --source-url URL   base file:// (o ruta absoluta) con MANIFEST.json y
                      ${TARBALL_NAME}; exige --root explícito y no fuerza HTTPS.
+  --check-url file://ruta   verificación local del symlink servido, sin red.
 Entorno:
   VISOR_MANIFEST_HELPER  ruta al helper deploy/manifest.sh (default: junto al script)
+  VISOR_CHECK_URL        default de --check-url
 
 Exit: 0 éxito/skip/busy · 1 fallo de ejecución · 2 uso/artefacto/layout inválido.
 EOF
@@ -151,6 +185,20 @@ parse_args() {
         STATUS=1
         shift
         ;;
+      --force)
+        FORCE=1
+        shift
+        ;;
+      --rollback)
+        ROLLBACK=1
+        shift
+        ;;
+      --check-url)
+        (( $# >= 2 )) || die_usage 'falta el valor de --check-url'
+        [[ -n "$2" ]] || die_usage '--check-url no admite un valor vacío'
+        CHECK_URL="$2"
+        shift 2
+        ;;
       -h|--help)
         print_usage
         exit 0
@@ -166,6 +214,10 @@ parse_args() {
 
   [[ "${ROOT}" == /* ]] || die_usage "--root debe ser una ruta absoluta: ${ROOT}"
   [[ -d "${ROOT}" ]] || die_usage "--root no existe o no es un directorio: ${ROOT}"
+
+  if (( ROLLBACK && DRY_RUN )); then
+    die_usage '--rollback y --dry-run no se combinan'
+  fi
 
   if (( SOURCE_URL_OVERRIDE )); then
     (( ROOT_EXPLICIT )) || die_usage '--source-url es sólo para tests y exige --root explícito'
@@ -187,7 +239,7 @@ parse_args() {
 
 missing_dependencies() {
   local cmd
-  for cmd in curl tar flock mktemp sha256sum find sort xargs stat chmod mv rm mkdir date; do
+  for cmd in curl tar flock mktemp sha256sum find sort xargs stat chmod mv cp ln readlink rm mkdir date; do
     command -v "${cmd}" >/dev/null 2>&1 || printf '%s\n' "${cmd}"
   done
   return 0
@@ -387,6 +439,8 @@ state_load() {
 
 state_set() { STATE_MAP["$1"]="$2"; }
 
+state_unset() { unset "STATE_MAP[$1]"; }
+
 state_value() { printf '%s' "${STATE_MAP[$1]:-}"; }
 
 # state_flush: escribe todas las claves (las gestionadas y las desconocidas que
@@ -563,16 +617,139 @@ promote_release() { # <commit> -> RELEASE_PATH
   RELEASE_PATH="${dest}"
 }
 
-# --- Seam PR4 ------------------------------------------------------------------
+# --- Activación (P-D15/P-D16/P-D17/P-D25) --------------------------------------
 #
-# Acá va la activación atómica de PR4: snapshot .prev (cp -a www/. ), swap del
-# symlink con `ln -sfn releases/<id> .www.swap && mv -T .www.swap www`,
-# verificación post-swap contra http://127.0.0.1:1984/ y rollback con cuarentena
-# (el commit fallado no se reintenta sin --force). En PR3 el release queda
-# validado y visible en STAGED_COMMIT/STAGED_PATH; el path servido no se toca.
-activate_release() { # <release-dir>
-  log "release validado, listo para activar (activación atómica: PR4): $1"
+# Semántica de www.prev: copia real (no symlink, no rename) del contenido
+# servido antes del swap; es el destino del rollback. Mientras www sirva desde
+# www.prev (post-rollback), el snapshot se conserva tal cual: reemplazarlo
+# borraría el contenido vivo. La activación siguiente (con www sobre
+# releases/<id>) vuelve a copiar normalmente.
+#
+# Atomicidad: el swap es `ln -sfn <destino> .www.swap && mv -T .www.swap www`,
+# un único rename(2) de symlink sobre symlink: el path servido nunca falta ni
+# queda a medio escribir. Un corte se reanuda con ACTIVATION_PENDING.
+
+swap_www_to() { # <destino relativo al directorio padre de www>
+  local target="$1"
+  ln -sfn -- "${target}" "${WWW_SWAP_PATH}" || return 1
+  if ! mv -T -- "${WWW_SWAP_PATH}" "${WWW_DIR}"; then
+    rm -f -- "${WWW_SWAP_PATH}"
+    return 1
+  fi
   return 0
+}
+
+snapshot_prev() {
+  local www_resolved prev_resolved
+  www_resolved="$(readlink -f -- "${WWW_DIR}" 2>/dev/null || true)"
+  prev_resolved="$(readlink -f -- "${WWW_PREV_DIR}" 2>/dev/null || true)"
+  if [[ -n "${www_resolved}" && -n "${prev_resolved}" && "${www_resolved}" == "${prev_resolved}" ]]; then
+    log "www ya sirve desde ${WWW_PREV_DIR}; se conserva como rollback"
+    return 0
+  fi
+  rm -rf -- "${WWW_PREV_DIR}.new" || fail_run "no se pudo limpiar ${WWW_PREV_DIR}.new"
+  mkdir -p -- "${WWW_PREV_DIR}.new" || fail_run "no se pudo crear ${WWW_PREV_DIR}.new"
+  cp -a -- "${WWW_DIR}/." "${WWW_PREV_DIR}.new/" \
+    || fail_run "no se pudo copiar el sitio servido a ${WWW_PREV_DIR}.new"
+  rm -rf -- "${WWW_PREV_DIR}" || fail_run "no se pudo reemplazar ${WWW_PREV_DIR}"
+  mv -T -- "${WWW_PREV_DIR}.new" "${WWW_PREV_DIR}" || fail_run "no se pudo instalar ${WWW_PREV_DIR}"
+  log "snapshot .prev actualizado: ${WWW_PREV_DIR}"
+}
+
+verify_served_release() { # <commit> -> 0 si el sitio sirve y responde ese commit
+  local commit="$1" base out got
+  VERIFY_ERROR=""
+  got="$(live_commit)"
+  if [[ "${got}" != "${commit}" ]]; then
+    VERIFY_ERROR="el symlink ${WWW_DIR} sirve ${got:-nada} (esperado ${commit:0:7})"
+    return 1
+  fi
+  base="${CHECK_URL%/}"
+  out="${RUN_TMP}/check-root.html"
+  if ! curl -fsS --connect-timeout "${CHECK_TIMEOUT}" --max-time "${CHECK_TIMEOUT}" \
+    -o "${out}" "${base}/"; then
+    VERIFY_ERROR="no se pudo consultar ${base}/"
+    return 1
+  fi
+  if [[ ! -s "${out}" ]]; then
+    VERIFY_ERROR="${base}/ respondió vacío"
+    return 1
+  fi
+  out="${RUN_TMP}/check-manifest.json"
+  if ! curl -fsS --connect-timeout "${CHECK_TIMEOUT}" --max-time "${CHECK_TIMEOUT}" \
+    -o "${out}" "${base}/MANIFEST.json"; then
+    VERIFY_ERROR="no se pudo consultar ${base}/MANIFEST.json"
+    return 1
+  fi
+  got="$(manifest_field "${out}" commit 2>/dev/null)" || got=""
+  if [[ "${got}" != "${commit}" ]]; then
+    VERIFY_ERROR="${base}/MANIFEST.json sirve ${got:-nada} (esperado ${commit:0:7})"
+    return 1
+  fi
+  return 0
+}
+
+rollback_and_fail() { # <commit-fallado> <motivo> -> exit 1
+  local commit="$1" reason="$2" now live
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  state_set QUARANTINED_COMMIT "${commit}"
+  state_set QUARANTINED_AT "${now}"
+  state_unset ACTIVATION_PENDING
+  if [[ -e "${WWW_PREV_DIR}" ]] && swap_www_to "${WWW_PREV_DIR##*/}"; then
+    err "rollback: ${WWW_DIR} vuelve a ${WWW_PREV_DIR}"
+    live="$(live_commit)"
+    if [[ -n "${PREV_COMMIT}" && "${live}" != "${PREV_COMMIT}" ]]; then
+      warn "rollback: se sirve ${live:-nada}, distinto de lo servido antes (${PREV_COMMIT:0:7})"
+    fi
+  else
+    warn "rollback: no se pudo volver a ${WWW_PREV_DIR}; el sitio queda en el release no verificado"
+  fi
+  record_outcome failed "${reason}"
+  exit 1
+}
+
+finalize_activation() { # <commit> <release>
+  local commit="$1" release="$2" now
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  state_set ACTIVATED_COMMIT "${commit}"
+  state_set ACTIVATED_AT "${now}"
+  state_set STAGED_COMMIT "${commit}"
+  state_set STAGED_AT "${now}"
+  [[ -n "${release}" ]] && state_set STAGED_PATH "${release}"
+  state_unset ACTIVATION_PENDING
+  if [[ "$(state_value QUARANTINED_COMMIT)" == "${commit}" ]]; then
+    state_unset QUARANTINED_COMMIT
+    state_unset QUARANTINED_AT
+  fi
+}
+
+activate_release() { # <release-dir>
+  local release="$1" commit rel
+  [[ -d "${release}" && -f "${release}/MANIFEST.json" ]] \
+    || fail_run "activación: release inválido: ${release}"
+  commit="$(manifest_field "${release}/MANIFEST.json" commit 2>/dev/null)" || commit=""
+  [[ -n "${commit}" ]] || fail_run "activación: el release no declara commit: ${release}"
+  rel="${release#"${RELEASES_DIR}/"}"
+  if [[ "${rel}" == "${release}" || "${rel}" == */* || -z "${rel}" ]]; then
+    fail_run "activación: release fuera de ${RELEASES_DIR}: ${release}"
+  fi
+  PREV_COMMIT="$(live_commit)"
+  snapshot_prev
+  state_set ACTIVATION_PENDING "${commit}"
+  state_set STAGED_COMMIT "${commit}"
+  state_set STAGED_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  state_set STAGED_PATH "${release}"
+  state_flush
+  if ! swap_www_to "releases/${rel}"; then
+    state_unset ACTIVATION_PENDING
+    fail_run "activación: no se pudo hacer el swap atómico de ${WWW_DIR}"
+  fi
+  if ! verify_served_release "${commit}"; then
+    rollback_and_fail "${commit}" "activación fallida: ${VERIFY_ERROR}"
+  fi
+  finalize_activation "${commit}" "${release}"
+  record_outcome success ''
+  log "release activado y verificado: ${release}"
 }
 
 prune_releases() { # <keep>
@@ -602,10 +779,44 @@ prune_releases() { # <keep>
   return 0
 }
 
+# resume_pending_activation: si un corte dejó ACTIVATION_PENDING, decide con el
+# estado real del symlink. Devuelve 0 si resolvió el run (verificó y finalizó, o
+# hizo rollback); 1 para seguir con las fases normales.
+resume_pending_activation() {
+  local pending live release
+  pending="$(state_value ACTIVATION_PENDING)"
+  [[ -n "${pending}" ]] || return 1
+  if (( DRY_RUN )); then
+    warn "dry-run: hay una activación pendiente (${pending:0:7}); no se toca (reanudala sin --dry-run)"
+    return 0
+  fi
+  live="$(live_commit)"
+  if [[ "${live}" != "${pending}" ]]; then
+    log "activación pendiente ${pending:0:7} sin aplicar; se limpia y se reintenta"
+    state_unset ACTIVATION_PENDING
+    state_flush
+    return 1
+  fi
+  log "activación pendiente detectada (${pending:0:7}); se verifica antes de continuar"
+  if ! verify_served_release "${pending}"; then
+    rollback_and_fail "${pending}" "activación pendiente no verificó: ${VERIFY_ERROR}"
+  fi
+  release="$(find_staged_release "${pending:0:7}")"
+  finalize_activation "${pending}" "${release}"
+  record_outcome success ''
+  log "activación pendiente completada y verificada: ${pending:0:7}"
+  prune_releases "${KEEP_RELEASES}"
+  return 0
+}
+
 run_phases() {
-  local served candidate staged commit tarball_existing
+  local served candidate staged commit tarball_existing quarantine
+  if resume_pending_activation; then
+    return 0
+  fi
   served="$(live_commit)"
   candidate="$(fetch_candidate_commit)"
+  quarantine="$(state_value QUARANTINED_COMMIT)"
 
   if [[ -n "${candidate}" ]]; then
     if [[ "${candidate}" == "${served}" ]]; then
@@ -613,11 +824,16 @@ run_phases() {
       record_outcome skipped ''
       return 0
     fi
+    if [[ "${candidate}" == "${quarantine}" ]] && (( ! FORCE )); then
+      log "commit en cuarentena (${candidate:0:7}); no se re-aplica sin --force"
+      record_outcome quarantined "commit en cuarentena: ${candidate:0:7}"
+      return 0
+    fi
     staged="$(find_staged_release "${candidate:0:7}")"
     if [[ -n "${staged}" ]]; then
-      # SEAM PR4: con el release ya validado, acá PR4 activaría (swap + .prev).
-      log "sin cambios: ${candidate:0:7} ya está staged en ${staged}"
-      record_outcome skipped ''
+      log "release ya validado (${candidate:0:7}); se activa: ${staged}"
+      activate_release "${staged}"
+      prune_releases "${KEEP_RELEASES}"
       return 0
     fi
     if (( DRY_RUN )); then
@@ -642,28 +858,32 @@ run_phases() {
     record_outcome skipped ''
     return 0
   fi
+  if [[ "${commit}" == "${quarantine}" ]] && (( ! FORCE )); then
+    log "commit en cuarentena (${commit:0:7}); se descarta el staging"
+    cleanup_run
+    record_outcome quarantined "commit en cuarentena: ${commit:0:7}"
+    return 0
+  fi
   tarball_existing="$(find_staged_release "${commit:0:7}")"
   if [[ -n "${tarball_existing}" ]]; then
-    log "sin cambios: ${commit:0:7} ya está staged en ${tarball_existing}"
-    cleanup_run
-    record_outcome skipped ''
+    log "release ya validado (${commit:0:7}); se activa: ${tarball_existing}"
+    if [[ -n "${STAGING_ACTIVE}" && -d "${STAGING_ACTIVE}" ]]; then
+      rm -rf -- "${STAGING_ACTIVE}"
+    fi
+    STAGING_ACTIVE=""
+    activate_release "${tarball_existing}"
+    prune_releases "${KEEP_RELEASES}"
     return 0
   fi
 
   promote_release "${commit}"
   activate_release "${RELEASE_PATH}"
   prune_releases "${KEEP_RELEASES}"
-
-  state_set STAGED_COMMIT "${commit}"
-  state_set STAGED_AT "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  state_set STAGED_PATH "${RELEASE_PATH}"
-  record_outcome success ''
-  log "release staged: ${RELEASE_PATH}"
   return 0
 }
 
 cmd_status() {
-  local served outcome
+  local served outcome activated quarantined
   served="$(state_file_value SERVED_COMMIT)"
   outcome="$(state_file_value LAST_OUTCOME)"
   if [[ -z "${served}" ]]; then
@@ -671,7 +891,13 @@ cmd_status() {
   fi
   [[ -n "${served}" ]] || served="unknown"
   [[ -n "${outcome}" ]] || outcome="unknown"
+  activated="$(state_file_value ACTIVATED_COMMIT)"
+  [[ -n "${activated}" ]] || activated="unknown"
+  quarantined="$(state_file_value QUARANTINED_COMMIT)"
+  [[ -n "${quarantined}" ]] || quarantined="none"
   printf 'SERVED_COMMIT=%s\n' "${served}"
+  printf 'ACTIVATED_COMMIT=%s\n' "${activated}"
+  printf 'QUARANTINED_COMMIT=%s\n' "${quarantined}"
   printf 'LAST_OUTCOME=%s\n' "${outcome}"
   if [[ -f "${STATE_PATH}" ]]; then
     printf -- '--- estado completo (%s) ---\n' "${STATE_PATH}"
@@ -681,6 +907,28 @@ cmd_status() {
   fi
   printf 'SERVED_PATH=%s\n' "$(resolve_www_path)"
   printf 'STAGED_RELEASES=%s\n' "$(count_releases)"
+  return 0
+}
+
+cmd_rollback() { # operador: www -> www.prev + cuarentena del commit servido
+  local served now
+  if [[ ! -e "${WWW_PREV_DIR}" ]]; then
+    fail_run "rollback manual: no existe ${WWW_PREV_DIR}; no hay a qué volver"
+  fi
+  served="$(live_commit)"
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if ! swap_www_to "${WWW_PREV_DIR##*/}"; then
+    fail_run "rollback manual: no se pudo hacer el swap de ${WWW_DIR}"
+  fi
+  state_unset ACTIVATION_PENDING
+  if [[ -n "${served}" ]]; then
+    state_set QUARANTINED_COMMIT "${served}"
+    state_set QUARANTINED_AT "${now}"
+  else
+    warn 'rollback manual: no se pudo leer el commit servido; no se cuarentenó nada'
+  fi
+  record_outcome quarantined "rollback manual: ${served:0:7}"
+  log "rollback manual completo: ${WWW_DIR} -> ${WWW_PREV_DIR} (cuarentena: ${served:0:7})"
   return 0
 }
 
@@ -694,7 +942,6 @@ main_update() {
   fi
 
   require_dependencies
-  load_manifest_helper
   state_load
 
   if (( SOURCE_URL_OVERRIDE )); then
@@ -715,6 +962,13 @@ main_update() {
     exit 0
   fi
 
+  if (( ROLLBACK )); then
+    # El rollback no valida artefactos: no debe depender del helper de manifiesto.
+    cmd_rollback
+    exit 0
+  fi
+
+  load_manifest_helper
   umask 077
   RUN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/visor-camaras-update.XXXXXX")"
   trap 'cleanup_run' EXIT INT TERM

@@ -5,21 +5,27 @@
 # Uso:
 #   bash deploy/tests/update-frontend.test.sh
 #
-# Alcance (slice PR3): fetch/validar/staging/estado/poda + unidades systemd.
-# La activación atómica, el rollback y la cuarentena son PR4: no se prueban acá.
+# Alcance (slice PR4): fetch/validar/staging + activación atómica (swap del
+# symlink), .prev, verificación post-swap, rollback, cuarentena y reanudación
+# de una activación interrumpida, más estado/poda y unidades systemd.
 #
 # Sólo usa bash + coreutils + tar + flock + curl (el runtime del propio updater).
 # No requiere root ni red: el updater corre con --root en un sandbox y
 # --source-url file://…; las fallas de red y de permisos se inyectan stubbeando
-# curl, igual que install-lxc.test.sh stubbea chown/systemctl.
+# curl, igual que install-lxc.test.sh stubbea chown/systemctl. La verificación
+# post-swap apunta a --check-url file://<sandbox>/opt/visor-camaras/www, que
+# curl resuelve localmente contra el symlink servido (sin red y sin stubs).
 #
 # Cubre:
 #   - CLI: uso, flags, contención del hook --source-url, --status sin estado
 #   - helpers puros: manifest_field, index_src_targets, artifact_index_error,
 #     tar_entries_error, release_id, missing_dependencies
-#   - sandbox end-to-end: staging válido, idempotencia, skip, manifiesto y tar
-#     hostiles, fetch parcial/vacío, tope de tamaño, layout inválido, flock
-#     ocupado, --dry-run, poda acotada, estado atómico
+#   - sandbox end-to-end: staging válido, activación atómica, .prev, idempotencia,
+#     skip, manifiesto y tar hostiles, fetch parcial/vacío, tope de tamaño,
+#     layout inválido, flock ocupado, --dry-run, poda acotada, estado atómico
+#   - activación: verificación post-swap (ok / commit incorrecto / check
+#     inejecutable), rollback, cuarentena, --force, --rollback manual y
+#     reanudación de ACTIVATION_PENDING tras un corte
 #   - unidades systemd: invariantes estructurales (cadencia + endurecimiento)
 #
 # Corta en el primer fallo (exit 1) para mantener la salida legible.
@@ -145,6 +151,14 @@ curl() {
   done
   url="${args[${#args[@]} - 1]}"
 
+  # file:// fuera del directorio publicado (p. ej. el --check-url de la
+  # verificación post-swap): se atiende con curl real, que para file:// no usa
+  # la red. Así la verificación lee de verdad el symlink servido del sandbox.
+  if [[ "${url}" == file://* && "${url}" != "file://${PUB_DIR}/"* ]]; then
+    command curl "$@"
+    return $?
+  fi
+
   if [[ "${url}" == *MANIFEST.json ]]; then
     if [[ "${CURL_MANIFEST_MODE}" == "fail" ]]; then
       return 22
@@ -180,6 +194,40 @@ run_update() {
   local errfile="${WORK_DIR}/run.stderr"
   set +e
   OUT="$( ( main_update "$@" ) </dev/null 2>"${errfile}" )"
+  RC=$?
+  set -e
+  ERR="$(<"${errfile}")"
+}
+
+# run_update_swap_falla <args...>: inyecta un fallo del swap atómico de la
+# activación. La redefinición vive sólo en el subshell.
+run_update_swap_falla() {
+  local errfile="${WORK_DIR}/run.stderr"
+  set +e
+  OUT="$( ( swap_www_to() { return 1; }; main_update "$@" ) </dev/null 2>"${errfile}" )"
+  RC=$?
+  set -e
+  ERR="$(<"${errfile}")"
+}
+
+# run_update_swap_equivocado <args...>: el swap de activación apunta al release
+# viejo (rc 0), así la verificación local detecta que no se sirve el commit
+# nuevo; el swap del rollback (destino www.prev) sí se aplica de verdad.
+run_update_swap_equivocado() {
+  local errfile="${WORK_DIR}/run.stderr"
+  set +e
+  OUT="$( (
+    swap_www_to() {
+      local target="$1"
+      if [[ "${target}" == "www.prev" ]]; then
+        ln -sfn -- "${target}" "${WWW_SWAP_PATH}" && mv -T -- "${WWW_SWAP_PATH}" "${WWW_DIR}"
+      else
+        ln -sfn -- "releases/20260101T000000Z-${SERVED_SHA7}" "${WWW_SWAP_PATH}" \
+          && mv -T -- "${WWW_SWAP_PATH}" "${WWW_DIR}"
+      fi
+    }
+    main_update "$@"
+  ) </dev/null 2>"${errfile}" )"
   RC=$?
   set -e
   ERR="$(<"${errfile}")"
@@ -270,6 +318,51 @@ www_target() { # <sandbox>
   readlink -- "$1/opt/visor-camaras/www"
 }
 
+www_prev_is_real_dir() { # <sandbox> -> 1 si www.prev existe como directorio real
+  if [[ -d "$1/opt/visor-camaras/www.prev" && ! -L "$1/opt/visor-camaras/www.prev" ]]; then
+    printf '1'
+  else
+    printf '0'
+  fi
+}
+
+prev_commit_in() { # <sandbox> -> commit del MANIFEST.json de www.prev
+  local mf="$1/opt/visor-camaras/www.prev/MANIFEST.json"
+  [[ -f "${mf}" ]] || return 0
+  manifest_field "${mf}" commit
+}
+
+activate_check_url() { # <sandbox>: check-url local que lee el symlink servido
+  printf 'file://%s/opt/visor-camaras/www' "$1"
+}
+
+make_check_fixture() { # <dir> <commit>: "sitio servido" ajeno para el check
+  mkdir -p -- "$1"
+  printf '<!doctype html><html><body><app-root></app-root></body></html>\n' > "$1/index.html"
+  write_manifest_for "$1" "$2"
+}
+
+# crash_activation_state <sandbox> <commit> <con-swap:0|1>: deja el sandbox como
+# si el updater hubiera muerto en medio de la activación. Si <con-swap> es 1,
+# www ya apunta al release nuevo (corte tras el swap); si es 0, www sigue viejo
+# (corte tras el snapshot, antes del swap). En ambos casos .prev es la copia del
+# contenido anterior y el estado declara ACTIVATION_PENDING.
+crash_activation_state() {
+  local sb="$1" commit="$2" con_swap="$3"
+  local rel="releases/20260201T000000Z-${commit:0:7}"
+  make_artifact "${sb}/opt/visor-camaras/${rel}" "pendiente"
+  write_manifest_for "${sb}/opt/visor-camaras/${rel}" "${commit}"
+  mkdir -p "${sb}/opt/visor-camaras/www.prev"
+  cp -a -- "${sb}/opt/visor-camaras/www/." "${sb}/opt/visor-camaras/www.prev/"
+  if (( con_swap )); then
+    ln -sfn -- "${rel}" "${sb}/opt/visor-camaras/.www.swap"
+    mv -T -- "${sb}/opt/visor-camaras/.www.swap" "${sb}/opt/visor-camaras/www"
+  fi
+  mkdir -p "${sb}/var/lib/visor-camaras-update"
+  printf 'ACTIVATION_PENDING=%s\nSERVED_COMMIT=%s\n' "${commit}" "${SERVED_COMMIT}" \
+    > "${sb}/var/lib/visor-camaras-update/state"
+}
+
 served_commit_in() { # <sandbox>
   local mf="$1/opt/visor-camaras/www/MANIFEST.json"
   [[ -f "${mf}" ]] || return 0
@@ -321,9 +414,15 @@ run_capture bash "${UPDATER}" --volar
 assert_eq "exit 2" "2" "${RC}"
 assert_contains "motivo" "${ERR}" 'desconocida'
 
-begin "--rollback todavía no existe (es PR4) -> exit 2"
-run_capture bash "${UPDATER}" --rollback
+begin "--check-url sin valor -> exit 2"
+run_capture bash "${UPDATER}" --root "${WORK_DIR}" --check-url
 assert_eq "exit 2" "2" "${RC}"
+assert_contains "falta el valor" "${ERR}" 'falta el valor'
+
+begin "--rollback con --dry-run -> exit 2 (contradictorio)"
+run_capture bash "${UPDATER}" --root "${WORK_DIR}" --rollback --dry-run
+assert_eq "exit 2" "2" "${RC}"
+assert_contains "motivo" "${ERR}" 'no se combinan'
 
 begin "--root relativo -> exit 2"
 run_capture bash "${UPDATER}" --root relativo
@@ -513,27 +612,34 @@ assert_eq "sin OnCalendar" "0" "$(unit_key_count "${UNIT_TIMER}" OnCalendar)"
 
 printf '\n== sandbox: staging válido ==\n'
 
-begin "artefacto nuevo válido -> release staged, servido intacto, estado success"
+begin "artefacto nuevo válido -> swap atómico, .prev real, estado success (activado)"
 prepare_sandbox "ok"
 prepare_published "${NEW_COMMIT}" "nuevo"
 CURL_MANIFEST_MODE="ok"
 CURL_TARBALL_MODE="ok"
 : > "${CURL_ARGS_FILE}"
-run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
 assert_eq "exit 0" "0" "${RC}"
 RELEASE_DIR="$(find "${SB_ROOT}/opt/visor-camaras/releases" -mindepth 1 -maxdepth 1 -type d -name "*-${NEW_SHA7}" | head -n1)"
 assert_regex "nombre <UTC>-<sha7>" '/[0-9]{8}T[0-9]{6}Z-2222222$' "${RELEASE_DIR}"
 assert_exists "index.html promovido" "${RELEASE_DIR}/index.html"
 assert_exists "MANIFEST.json promovido" "${RELEASE_DIR}/MANIFEST.json"
 assert_exists "go2rtc/ promovido" "${RELEASE_DIR}/go2rtc/VERSION.txt"
-assert_eq "www sigue apuntando al release viejo" "releases/20260101T000000Z-${SERVED_SHA7}" "$(www_target "${SB_ROOT}")"
-assert_eq "lo servido no cambió" "${SERVED_COMMIT}" "$(served_commit_in "${SB_ROOT}")"
+assert_regex "www apunta al release nuevo" '^releases/[0-9]{8}T[0-9]{6}Z-'"${NEW_SHA7}"'$' "$(www_target "${SB_ROOT}")"
+assert_eq "lo servido es el release nuevo" "${NEW_COMMIT}" "$(served_commit_in "${SB_ROOT}")"
 assert_eq "2 releases" "2" "$(count_releases_in "${SB_ROOT}")"
-assert_eq "estado SERVED_COMMIT" "${SERVED_COMMIT}" "$(state_get "${SB_ROOT}" SERVED_COMMIT)"
+assert_eq "www.prev es copia (directorio real, no symlink)" "1" "$(www_prev_is_real_dir "${SB_ROOT}")"
+assert_eq "www.prev conserva el contenido anterior" "${SERVED_COMMIT}" "$(prev_commit_in "${SB_ROOT}")"
+assert_exists "el release anterior sigue en releases/ (copia, no rename)" "${SERVED_RELEASE}"
+assert_eq "estado SERVED_COMMIT" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" SERVED_COMMIT)"
+assert_ne "estado SERVED_AT" "" "$(state_get "${SB_ROOT}" SERVED_AT)"
+assert_eq "estado ACTIVATED_COMMIT" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" ACTIVATED_COMMIT)"
+assert_ne "estado ACTIVATED_AT" "" "$(state_get "${SB_ROOT}" ACTIVATED_AT)"
 assert_eq "estado STAGED_COMMIT" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" STAGED_COMMIT)"
 assert_eq "estado STAGED_PATH" "${RELEASE_DIR}" "$(state_get "${SB_ROOT}" STAGED_PATH)"
 assert_eq "estado LAST_OUTCOME" "success" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
 assert_eq "estado LAST_ERROR" "" "$(state_get "${SB_ROOT}" LAST_ERROR)"
+assert_eq "sin ACTIVATION_PENDING tras activar" "" "$(state_get "${SB_ROOT}" ACTIVATION_PENDING)"
 assert_eq "estado modo 0600" "600" "$(stat -c '%a' -- "${SB_ROOT}/var/lib/visor-camaras-update/state")"
 assert_eq "estado sin temporales" "" "$(find "${SB_ROOT}/var/lib/visor-camaras-update" -name '.state.*' -print -quit)"
 assert_clean_staging "staging limpio" "${SB_ROOT}"
@@ -548,13 +654,15 @@ assert_args_has "${CURL_ARGS_FILE}" '600'
 assert_args_has "${CURL_ARGS_FILE}" '--max-filesize'
 assert_args_has "${CURL_ARGS_FILE}" '52428800'
 
-begin "--status después de un run exitoso"
+begin "--status después de un run exitoso (confirma la activación)"
 run_update --status --root "${SB_ROOT}"
 assert_eq "exit 0" "0" "${RC}"
-assert_contains "SERVED_COMMIT" "${OUT}" "SERVED_COMMIT=${SERVED_COMMIT}"
+assert_contains "SERVED_COMMIT" "${OUT}" "SERVED_COMMIT=${NEW_COMMIT}"
 assert_contains "LAST_OUTCOME" "${OUT}" 'LAST_OUTCOME=success'
+assert_contains "ACTIVATED_COMMIT" "${OUT}" "ACTIVATED_COMMIT=${NEW_COMMIT}"
 assert_contains "STAGED_COMMIT" "${OUT}" "STAGED_COMMIT=${NEW_COMMIT}"
-assert_contains "path servido" "${OUT}" "SERVED_PATH=${SERVED_RELEASE}"
+assert_contains "path servido" "${OUT}" "SERVED_PATH=${RELEASE_DIR}"
+assert_contains "sin cuarentena" "${OUT}" 'QUARANTINED_COMMIT=none'
 
 printf '\n== sandbox: idempotencia ==\n'
 
@@ -570,29 +678,34 @@ assert_eq "no se descargó el tarball" "0" "$(grep -c 'frontend-dist.tar.gz' "${
 assert_eq "www intacto" "releases/20260101T000000Z-${SERVED_SHA7}" "$(www_target "${SB_ROOT}")"
 assert_clean_staging "staging limpio" "${SB_ROOT}"
 
-begin "commit ya staged -> el segundo run no re-descarga ni duplica"
+begin "activado en el primer run -> el segundo run no re-descarga ni duplica"
 prepare_sandbox "staged"
 prepare_published "${NEW_COMMIT}" "nuevo"
-run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
 assert_eq "primer run exit 0" "0" "${RC}"
 assert_eq "un release nuevo" "2" "$(count_releases_in "${SB_ROOT}")"
+assert_regex "www apunta al release nuevo" '^releases/[0-9]{8}T[0-9]{6}Z-'"${NEW_SHA7}"'$' "$(www_target "${SB_ROOT}")"
+assert_eq "activado" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" ACTIVATED_COMMIT)"
 : > "${CURL_ARGS_FILE}"
-run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
 assert_eq "segundo run exit 0" "0" "${RC}"
 assert_eq "estado skipped" "skipped" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
 assert_eq "sigue habiendo 2 releases" "2" "$(count_releases_in "${SB_ROOT}")"
 assert_eq "sin re-descarga del tarball" "0" "$(grep -c 'frontend-dist.tar.gz' "${CURL_ARGS_FILE}" || true)"
 assert_eq "STAGED_COMMIT preservado" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" STAGED_COMMIT)"
+assert_regex "www intacto" '^releases/[0-9]{8}T[0-9]{6}Z-'"${NEW_SHA7}"'$' "$(www_target "${SB_ROOT}")"
 
-begin "sin MANIFEST.json publicado -> decide con el tarball"
+begin "sin MANIFEST.json publicado -> decide con el tarball y activa"
 prepare_sandbox "fallback"
 prepare_published "${OTHER_COMMIT}" "sin-manifiesto"
 CURL_MANIFEST_MODE="fail"
-run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
 CURL_MANIFEST_MODE="ok"
 assert_eq "exit 0" "0" "${RC}"
 assert_eq "estado success" "success" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
 assert_eq "release del tarball" "${OTHER_COMMIT}" "$(state_get "${SB_ROOT}" STAGED_COMMIT)"
+assert_eq "activado" "${OTHER_COMMIT}" "$(state_get "${SB_ROOT}" ACTIVATED_COMMIT)"
+assert_eq "SERVED_COMMIT" "${OTHER_COMMIT}" "$(state_get "${SB_ROOT}" SERVED_COMMIT)"
 assert_contains "aviso de manifiesto" "${ERR}" 'MANIFEST.json'
 
 begin "sin manifiesto y tarball == servido -> skip sin promover"
@@ -605,6 +718,209 @@ assert_eq "exit 0" "0" "${RC}"
 assert_eq "estado skipped" "skipped" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
 assert_eq "un solo release" "1" "$(count_releases_in "${SB_ROOT}")"
 assert_clean_staging "staging limpio" "${SB_ROOT}"
+
+printf '\n== sandbox: verificación post-swap, rollback y cuarentena ==\n'
+
+begin "check post-swap que sirve el commit viejo -> rollback, cuarentena y sitio servido"
+prepare_sandbox "check-malo"
+prepare_published "${NEW_COMMIT}" "nuevo"
+CHECK_STALE="${WORK_DIR}/check-stale"
+make_check_fixture "${CHECK_STALE}" "${SERVED_COMMIT}"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "file://${CHECK_STALE}"
+assert_eq "exit 1" "1" "${RC}"
+assert_eq "estado failed" "failed" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_contains "error diagnóstico del check" "$(state_get "${SB_ROOT}" LAST_ERROR)" 'esperado'
+assert_eq "commit fallado en cuarentena" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
+assert_ne "cuarentena con timestamp" "" "$(state_get "${SB_ROOT}" QUARANTINED_AT)"
+assert_eq "www volvió a www.prev" "www.prev" "$(www_target "${SB_ROOT}")"
+assert_eq "www.prev es copia real" "1" "$(www_prev_is_real_dir "${SB_ROOT}")"
+assert_eq "el sitio sigue sirviendo el commit anterior" "${SERVED_COMMIT}" "$(served_commit_in "${SB_ROOT}")"
+assert_eq "SERVED_COMMIT no cambió" "${SERVED_COMMIT}" "$(state_get "${SB_ROOT}" SERVED_COMMIT)"
+assert_eq "sin ACTIVATION_PENDING" "" "$(state_get "${SB_ROOT}" ACTIVATION_PENDING)"
+assert_eq "nada se reportó como activado" "" "$(state_get "${SB_ROOT}" ACTIVATED_COMMIT)"
+assert_eq "el release promovido queda, sin podar" "2" "$(count_releases_in "${SB_ROOT}")"
+assert_clean_staging "staging limpio" "${SB_ROOT}"
+
+begin "check post-swap inejecutable -> NO se reporta success: rollback y cuarentena"
+prepare_sandbox "check-caido"
+prepare_published "${NEW_COMMIT}" "nuevo"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "file://${WORK_DIR}/no-existe-check"
+assert_eq "exit 1" "1" "${RC}"
+assert_eq "estado failed" "failed" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_contains "no se pudo consultar" "$(state_get "${SB_ROOT}" LAST_ERROR)" 'no se pudo consultar'
+assert_eq "commit fallado en cuarentena" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
+assert_eq "www volvió a www.prev" "www.prev" "$(www_target "${SB_ROOT}")"
+assert_eq "sirve el commit anterior" "${SERVED_COMMIT}" "$(served_commit_in "${SB_ROOT}")"
+assert_eq "SERVED_COMMIT no cambió" "${SERVED_COMMIT}" "$(state_get "${SB_ROOT}" SERVED_COMMIT)"
+
+begin "swap que aplica el release equivocado -> la verificación local lo detecta y hace rollback"
+prepare_sandbox "swap-equivocado"
+prepare_published "${NEW_COMMIT}" "nuevo"
+run_update_swap_equivocado --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
+assert_eq "exit 1" "1" "${RC}"
+assert_eq "estado failed" "failed" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_contains "detectado por el symlink" "$(state_get "${SB_ROOT}" LAST_ERROR)" 'el symlink'
+assert_eq "commit fallado en cuarentena" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
+assert_eq "www volvió a www.prev (sitio servido)" "www.prev" "$(www_target "${SB_ROOT}")"
+assert_eq "sirve el commit anterior" "${SERVED_COMMIT}" "$(served_commit_in "${SB_ROOT}")"
+
+begin "fallo del swap -> exit 1, www intacto, sin cuarentena (se reintenta)"
+prepare_sandbox "swap-falla"
+prepare_published "${NEW_COMMIT}" "nuevo"
+run_update_swap_falla --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
+assert_eq "exit 1" "1" "${RC}"
+assert_eq "estado failed" "failed" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_contains "motivo del swap" "$(state_get "${SB_ROOT}" LAST_ERROR)" 'swap atómico'
+assert_eq "www intacto" "releases/20260101T000000Z-${SERVED_SHA7}" "$(www_target "${SB_ROOT}")"
+assert_eq "sin cuarentena (no hubo rollback)" "" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
+assert_eq "sin pendiente colgado" "" "$(state_get "${SB_ROOT}" ACTIVATION_PENDING)"
+assert_eq "sirve el commit anterior" "${SERVED_COMMIT}" "$(served_commit_in "${SB_ROOT}")"
+
+printf '\n== sandbox: cuarentena P-D25 ==\n'
+
+begin "tras el rollback, el siguiente tick no re-aplica el commit en cuarentena"
+prepare_sandbox "q-skip"
+prepare_published "${NEW_COMMIT}" "nuevo"
+CHECK_STALE="${WORK_DIR}/check-stale-q"
+make_check_fixture "${CHECK_STALE}" "${SERVED_COMMIT}"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "file://${CHECK_STALE}"
+assert_eq "primer run exit 1 (rollback)" "1" "${RC}"
+assert_eq "cuarentena registrada" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
+: > "${CURL_ARGS_FILE}"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
+assert_eq "segundo run exit 0" "0" "${RC}"
+assert_eq "estado quarantined" "quarantined" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_contains "motivo de cuarentena" "$(state_get "${SB_ROOT}" LAST_ERROR)" 'cuarentena'
+assert_eq "cuarentena conservada" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
+assert_eq "www sigue en www.prev" "www.prev" "$(www_target "${SB_ROOT}")"
+assert_eq "sirve el commit anterior" "${SERVED_COMMIT}" "$(served_commit_in "${SB_ROOT}")"
+assert_eq "sin descarga del tarball" "0" "$(grep -c 'frontend-dist.tar.gz' "${CURL_ARGS_FILE}" || true)"
+assert_eq "nada activado" "" "$(state_get "${SB_ROOT}" ACTIVATED_COMMIT)"
+
+begin "--force re-aplica el commit en cuarentena y levanta la cuarentena al verificar"
+prepare_sandbox "q-force"
+prepare_published "${NEW_COMMIT}" "nuevo"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "file://${CHECK_STALE}"
+assert_eq "primer run exit 1 (rollback)" "1" "${RC}"
+run_update --force --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
+assert_eq "run forzado exit 0" "0" "${RC}"
+assert_eq "estado success" "success" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_eq "activado" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" ACTIVATED_COMMIT)"
+assert_eq "cuarentena levantada" "" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
+assert_regex "www apunta al release nuevo" '^releases/[0-9]{8}T[0-9]{6}Z-'"${NEW_SHA7}"'$' "$(www_target "${SB_ROOT}")"
+
+begin "sin manifiesto, la cuarentena se evalúa tras validar el tarball"
+prepare_sandbox "q-fallback"
+mkdir -p "${SB_ROOT}/var/lib/visor-camaras-update"
+printf 'QUARANTINED_COMMIT=%s\n' "${NEW_COMMIT}" > "${SB_ROOT}/var/lib/visor-camaras-update/state"
+prepare_published "${NEW_COMMIT}" "nuevo"
+CURL_MANIFEST_MODE="fail"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
+CURL_MANIFEST_MODE="ok"
+assert_eq "exit 0" "0" "${RC}"
+assert_eq "estado quarantined" "quarantined" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_eq "un solo release (no se promovió)" "1" "$(count_releases_in "${SB_ROOT}")"
+assert_eq "www intacto" "releases/20260101T000000Z-${SERVED_SHA7}" "$(www_target "${SB_ROOT}")"
+assert_clean_staging "staging limpio" "${SB_ROOT}"
+
+begin "--force con actualización disponible -> dry-run no escribe nada"
+prepare_sandbox "force-dry"
+prepare_published "${NEW_COMMIT}" "nuevo"
+run_update --force --dry-run --root "${SB_ROOT}" --source-url "file://${PUB_DIR}"
+assert_eq "exit 0" "0" "${RC}"
+assert_contains "anuncia actualización" "${OUT}" 'dry-run'
+assert_missing "sin estado" "${SB_ROOT}/var/lib/visor-camaras-update/state"
+
+printf '\n== sandbox: rollback manual y corte en medio de la activación ==\n'
+
+begin "rollback manual -> www vuelve a www.prev y el commit servido queda en cuarentena"
+prepare_sandbox "rollback-manual"
+prepare_published "${NEW_COMMIT}" "nuevo"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
+assert_eq "activación previa exit 0" "0" "${RC}"
+assert_eq "activado" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" ACTIVATED_COMMIT)"
+: > "${CURL_ARGS_FILE}"
+run_update --rollback --root "${SB_ROOT}"
+assert_eq "rollback exit 0" "0" "${RC}"
+assert_eq "www volvió a www.prev" "www.prev" "$(www_target "${SB_ROOT}")"
+assert_eq "sirve el commit anterior" "${SERVED_COMMIT}" "$(state_get "${SB_ROOT}" SERVED_COMMIT)"
+assert_eq "servido en disco" "${SERVED_COMMIT}" "$(served_commit_in "${SB_ROOT}")"
+assert_eq "commit revertido en cuarentena" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
+assert_eq "estado quarantined" "quarantined" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_contains "motivo" "$(state_get "${SB_ROOT}" LAST_ERROR)" 'rollback manual'
+assert_eq "sin red en el rollback manual" "" "$(cat -- "${CURL_ARGS_FILE}")"
+
+begin "tras un rollback manual, el tick siguiente no re-aplica (sin --force)"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
+assert_eq "exit 0" "0" "${RC}"
+assert_eq "estado quarantined" "quarantined" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_eq "www sigue en www.prev" "www.prev" "$(www_target "${SB_ROOT}")"
+
+begin "rollback manual sin www.prev -> exit 1, sin tocar nada"
+prepare_sandbox "rollback-sin-prev"
+run_update --rollback --root "${SB_ROOT}"
+assert_eq "exit 1" "1" "${RC}"
+assert_contains "no hay a qué volver" "$(state_get "${SB_ROOT}" LAST_ERROR)" 'no existe'
+assert_eq "www intacto" "releases/20260101T000000Z-${SERVED_SHA7}" "$(www_target "${SB_ROOT}")"
+assert_eq "un solo release" "1" "$(count_releases_in "${SB_ROOT}")"
+
+begin "corte tras el swap: se reanuda, verifica y finaliza la activación"
+prepare_sandbox "resume-ok"
+crash_activation_state "${SB_ROOT}" "${NEW_COMMIT}" 1
+: > "${CURL_ARGS_FILE}"
+run_update --root "${SB_ROOT}" --check-url "$(activate_check_url "${SB_ROOT}")"
+assert_eq "exit 0" "0" "${RC}"
+assert_eq "estado success" "success" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_eq "activación completada" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" ACTIVATED_COMMIT)"
+assert_eq "sin pendiente" "" "$(state_get "${SB_ROOT}" ACTIVATION_PENDING)"
+assert_eq "www sigue en el release nuevo" "releases/20260201T000000Z-${NEW_SHA7}" "$(www_target "${SB_ROOT}")"
+assert_eq "sin descarga del tarball" "0" "$(grep -c 'frontend-dist.tar.gz' "${CURL_ARGS_FILE}" || true)"
+assert_eq "sin fetch del canal publicado" "0" "$(grep -c 'codeload.github.com' "${CURL_ARGS_FILE}" || true)"
+assert_eq "el check sí corrió" "1" "$(grep -cxF "file://${SB_ROOT}/opt/visor-camaras/www/MANIFEST.json" "${CURL_ARGS_FILE}" || true)"
+assert_eq "sin cuarentena" "" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
+
+begin "corte tras el swap y verificación fallida: rollback y cuarentena"
+prepare_sandbox "resume-fail"
+crash_activation_state "${SB_ROOT}" "${NEW_COMMIT}" 1
+CHECK_STALE="${WORK_DIR}/check-stale-resume"
+make_check_fixture "${CHECK_STALE}" "${SERVED_COMMIT}"
+run_update --root "${SB_ROOT}" --check-url "file://${CHECK_STALE}"
+assert_eq "exit 1" "1" "${RC}"
+assert_eq "estado failed" "failed" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_contains "motivo" "$(state_get "${SB_ROOT}" LAST_ERROR)" 'activación pendiente no verificó'
+assert_eq "www volvió a www.prev" "www.prev" "$(www_target "${SB_ROOT}")"
+assert_eq "commit en cuarentena" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
+assert_eq "sin pendiente" "" "$(state_get "${SB_ROOT}" ACTIVATION_PENDING)"
+
+begin "--dry-run con activación pendiente: no toca www ni el estado"
+prepare_sandbox "resume-dry"
+crash_activation_state "${SB_ROOT}" "${NEW_COMMIT}" 1
+run_update --dry-run --root "${SB_ROOT}" --check-url "$(activate_check_url "${SB_ROOT}")"
+assert_eq "exit 0" "0" "${RC}"
+assert_contains "avisa del pendiente" "${ERR}" 'pendiente'
+assert_eq "www no se tocó" "releases/20260201T000000Z-${NEW_SHA7}" "$(www_target "${SB_ROOT}")"
+assert_eq "ACTIVATION_PENDING intacto" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" ACTIVATION_PENDING)"
+assert_eq "sin ACTIVATED_COMMIT" "" "$(state_get "${SB_ROOT}" ACTIVATED_COMMIT)"
+
+begin "corte antes del swap: se limpia el pendiente y se activa normalmente"
+prepare_sandbox "resume-pre"
+crash_activation_state "${SB_ROOT}" "${NEW_COMMIT}" 0
+assert_eq "www quedó viejo" "releases/20260101T000000Z-${SERVED_SHA7}" "$(www_target "${SB_ROOT}")"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
+assert_eq "exit 0" "0" "${RC}"
+assert_eq "estado success" "success" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_eq "activación completada" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" ACTIVATED_COMMIT)"
+assert_eq "sin pendiente" "" "$(state_get "${SB_ROOT}" ACTIVATION_PENDING)"
+assert_eq "www apunta al release nuevo" "releases/20260201T000000Z-${NEW_SHA7}" "$(www_target "${SB_ROOT}")"
+
+begin "check-url por defecto: el target es el go2rtc local (127.0.0.1:1984)"
+prepare_sandbox "check-default"
+prepare_published "${NEW_COMMIT}" "nuevo"
+: > "${CURL_ARGS_FILE}"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}"
+assert_eq "exit 0 (stub de curl responde el check)" "0" "${RC}"
+assert_eq "root por defecto" "1" "$(grep -cxF 'http://127.0.0.1:1984/' "${CURL_ARGS_FILE}" || true)"
+assert_eq "manifest por defecto" "1" "$(grep -cxF 'http://127.0.0.1:1984/MANIFEST.json' "${CURL_ARGS_FILE}" || true)"
 
 printf '\n== sandbox: validación rechaza ==\n'
 
@@ -810,7 +1126,7 @@ assert_eq "exit 0" "0" "${RC}"
 assert_contains "sin cambios" "${OUT}" 'sin cambios'
 assert_missing "sin estado" "${SB_ROOT}/var/lib/visor-camaras-update/state"
 
-begin "poda: se conservan 5 releases nuevos + el release servido"
+begin "poda: se conservan 5 releases + el servido, sin romper .prev"
 prepare_sandbox "prune"
 i=1
 while (( i <= 7 )); do
@@ -822,48 +1138,78 @@ while (( i <= 7 )); do
 done
 assert_eq "8 releases antes de podar" "8" "$(count_releases_in "${SB_ROOT}")"
 prepare_published "${NEW_COMMIT}" "nuevo"
-run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
 assert_eq "exit 0" "0" "${RC}"
-assert_eq "6 releases después de podar" "6" "$(count_releases_in "${SB_ROOT}")"
-assert_exists "el release servido sobrevive a la poda" "${SERVED_RELEASE}"
-assert_eq "www sigue servido" "releases/20260101T000000Z-${SERVED_SHA7}" "$(www_target "${SB_ROOT}")"
+assert_eq "5 releases después de podar" "5" "$(count_releases_in "${SB_ROOT}")"
 assert_missing "release viejo 1 podado" "${SB_ROOT}/opt/visor-camaras/releases/20260201T000000Z-$(printf '%s' "$(fake_commit 'release-1')" | cut -c1-7)"
+assert_missing "el release que ya no se sirve se poda" "${SERVED_RELEASE}"
+assert_regex "www apunta al release nuevo y sobrevive" '^releases/[0-9]{8}T[0-9]{6}Z-'"${NEW_SHA7}"'$' "$(www_target "${SB_ROOT}")"
+assert_eq "www.prev conserva el contenido anterior" "${SERVED_COMMIT}" "$(prev_commit_in "${SB_ROOT}")"
 assert_eq "estado success tras podar" "success" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
 
-begin "el estado conserva claves desconocidas (seam de PR4)"
+begin "poda: el release servido se protege aunque sea el más viejo"
+prepare_sandbox "prune-guard"
+# Release staged (ya validado) con nombre anterior a los 7 históricos: al
+# activarlo, la poda debe verlo como servido y no borrarlo.
+staged_commit="$(fake_commit 'staged-guard')"
+staged_sha7="$(printf '%s' "${staged_commit}" | cut -c1-7)"
+staged_rel="${SB_ROOT}/opt/visor-camaras/releases/20260201T000000Z-${staged_sha7}"
+make_artifact "${staged_rel}" "staged-guard"
+write_manifest_for "${staged_rel}" "${staged_commit}"
+i=1
+while (( i <= 7 )); do
+  rel="${SB_ROOT}/opt/visor-camaras/releases/2026030${i}T000000Z-$(printf '%s' "$(fake_commit "post-$i")" | cut -c1-7)"
+  make_artifact "${rel}" "post${i}"
+  write_manifest_for "${rel}" "$(fake_commit "post-$i")"
+  i=$((i + 1))
+done
+prepare_published "${staged_commit}" "staged-guard"
+assert_eq "9 releases antes de podar" "9" "$(count_releases_in "${SB_ROOT}")"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
+assert_eq "exit 0" "0" "${RC}"
+assert_exists "release activado (el más viejo por nombre) sobrevive" "${staged_rel}"
+assert_regex "www apunta al release activado" "^releases/20260201T000000Z-${staged_sha7}$" "$(www_target "${SB_ROOT}")"
+assert_exists "www.prev sigue en su lugar" "${SB_ROOT}/opt/visor-camaras/www.prev"
+assert_eq "estado success" "success" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+
+begin "cuarentena de otro commit no bloquea (clave desconocida preservada)"
 prepare_sandbox "estado-merge"
 mkdir -p "${SB_ROOT}/var/lib/visor-camaras-update"
 printf 'QUARANTINED_COMMIT=%s\n' "${OTHER_COMMIT}" > "${SB_ROOT}/var/lib/visor-camaras-update/state"
 prepare_published "${NEW_COMMIT}" "nuevo"
-run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
 assert_eq "exit 0" "0" "${RC}"
-assert_eq "clave desconocida preservada" "${OTHER_COMMIT}" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
+assert_eq "cuarentena de otro commit preservada" "${OTHER_COMMIT}" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
 assert_eq "LAST_OUTCOME actualizado" "success" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_eq "activado" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" ACTIVATED_COMMIT)"
 
 printf '\n== sandbox: proceso real con curl file:// ==\n'
 
-begin "end-to-end sin stubs: fetch real file://, staging, estado y segundo run idempotente"
+begin "end-to-end sin stubs: fetch real file://, activación verificada y segundo run idempotente"
 prepare_sandbox "e2e"
 prepare_published "${NEW_COMMIT}" "e2e"
-run_capture bash "${UPDATER}" --root "${SB_ROOT}" --source-url "file://${PUB_DIR}"
+run_capture bash "${UPDATER}" --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
 assert_eq "exit 0" "0" "${RC}"
 RELEASE_E2E="$(find "${SB_ROOT}/opt/visor-camaras/releases" -mindepth 1 -maxdepth 1 -type d -name "*-${NEW_SHA7}" | head -n1)"
-assert_exists "release staged" "${RELEASE_E2E}/MANIFEST.json"
-assert_eq "www intacto" "releases/20260101T000000Z-${SERVED_SHA7}" "$(www_target "${SB_ROOT}")"
+assert_exists "release promovido" "${RELEASE_E2E}/MANIFEST.json"
+assert_regex "www apunta al release nuevo" '^releases/[0-9]{8}T[0-9]{6}Z-'"${NEW_SHA7}"'$' "$(www_target "${SB_ROOT}")"
+assert_eq "www.prev con el contenido anterior" "${SERVED_COMMIT}" "$(prev_commit_in "${SB_ROOT}")"
 assert_eq "estado success" "success" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_eq "ACTIVATED_COMMIT" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" ACTIVATED_COMMIT)"
 assert_eq "STAGED_COMMIT" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" STAGED_COMMIT)"
 assert_contains "aviso del hook de tests" "${ERR}" '--source-url'
 assert_clean_staging "staging limpio" "${SB_ROOT}"
 
-run_capture bash "${UPDATER}" --root "${SB_ROOT}" --source-url "file://${PUB_DIR}"
+run_capture bash "${UPDATER}" --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "$(activate_check_url "${SB_ROOT}")"
 assert_eq "segundo run exit 0" "0" "${RC}"
 assert_eq "estado skipped" "skipped" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
 assert_eq "sin releases duplicados" "2" "$(count_releases_in "${SB_ROOT}")"
 
 run_capture bash "${UPDATER}" --status --root "${SB_ROOT}"
 assert_eq "--status exit 0" "0" "${RC}"
-assert_contains "--status SERVED_COMMIT" "${OUT}" "SERVED_COMMIT=${SERVED_COMMIT}"
+assert_contains "--status SERVED_COMMIT" "${OUT}" "SERVED_COMMIT=${NEW_COMMIT}"
 assert_contains "--status LAST_OUTCOME" "${OUT}" 'LAST_OUTCOME=skipped'
+assert_contains "--status ACTIVATED_COMMIT" "${OUT}" "ACTIVATED_COMMIT=${NEW_COMMIT}"
 assert_contains "--status STAGED_COMMIT" "${OUT}" "STAGED_COMMIT=${NEW_COMMIT}"
 
 printf '\n\033[1;32mOK\033[0m: %d assertions pasaron.\n' "${CASES}"
