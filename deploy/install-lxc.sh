@@ -760,8 +760,9 @@ install_update_units() {
 }
 
 # seed_initial_release: release vacío inicial para que www apunte a un
-# directorio real desde el arranque (go2rtc sirve 404 hasta el primer update;
-# el updater puede snapshottearlo y activar sobre él sin casos especiales).
+# directorio real desde el arranque (hasta el primer update, GET / devuelve 200
+# con un listado de directorio vacío, no 404: el updater puede snapshottearlo y
+# activar sobre él sin casos especiales).
 seed_initial_release() {
   local initial="${RELEASES_DIR}/initial"
   install -d -m 0755 -- "${initial}" \
