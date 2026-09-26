@@ -35,7 +35,8 @@
 #   5. validación: index.html usable + tree_sha256 vía deploy/manifest.sh
 #   6. promoción a releases/<UTC>-<sha7> (rename en el mismo filesystem)
 #   7. snapshot .prev (copia real) + swap atómico del symlink www
-#   8. verificación post-swap (symlink + <check-url>/) y rollback con cuarentena
+#   8. verificación post-swap (symlink + <check-url>/index.html y MANIFEST.json)
+#      con rollback y cuarentena
 #   9. poda acotada (se conservan los 5 releases más nuevos + el servido)
 #  10. estado atómico en /var/lib/visor-camaras-update/state
 #
@@ -146,7 +147,9 @@ Opciones:
                      commit servido; no descarga nada ni requiere red
   --check-url URL    base de la verificación post-swap (default:
                      ${CHECK_URL_DEFAULT}); el updater exige que
-                     <URL>/MANIFEST.json sirva el commit recién activado.
+                     <URL>/index.html se sirva no vacío y coincida con el
+                     documento del release activado, y que <URL>/MANIFEST.json
+                     sirva el commit recién activado.
   -h, --help         esta ayuda
 
 Test-only:
@@ -239,7 +242,7 @@ parse_args() {
 
 missing_dependencies() {
   local cmd
-  for cmd in curl tar flock mktemp sha256sum find sort xargs stat chmod mv cp ln readlink rm mkdir date; do
+  for cmd in curl tar flock mktemp sha256sum find sort xargs stat chmod cmp mv cp ln readlink rm mkdir date; do
     command -v "${cmd}" >/dev/null 2>&1 || printf '%s\n' "${cmd}"
   done
   return 0
@@ -664,15 +667,25 @@ verify_served_release() { # <commit> -> 0 si el sitio sirve y responde ese commi
     VERIFY_ERROR="el symlink ${WWW_DIR} sirve ${got:-nada} (esperado ${commit:0:7})"
     return 1
   fi
+  # La verificación pide recursos concretos, nunca el listado de un directorio:
+  # `curl <base>/` para file:// devuelve bytes distintos según la versión de curl
+  # (listado en 8.18, 0 bytes en 8.5/7.88) y para HTTP depende de que el servidor
+  # genere un índice. Se pide index.html como documento raíz y, con -L, se sigue
+  # el redirect a `/` que hace el FileServer de go2rtc (mismo origen). El body
+  # bajado debe ser no vacío y, más abajo, byte a byte igual al index.html del
+  # release activado: una lista de directorio -el fallback del FileServer cuando
+  # no hay index.html- también es "no vacía", así que el contenido exacto es lo
+  # único que prueba que se sirve el documento del release. Un check que no puede
+  # correr falla; nunca cuenta como success.
   base="${CHECK_URL%/}"
   out="${RUN_TMP}/check-root.html"
-  if ! curl -fsS --connect-timeout "${CHECK_TIMEOUT}" --max-time "${CHECK_TIMEOUT}" \
-    -o "${out}" "${base}/"; then
-    VERIFY_ERROR="no se pudo consultar ${base}/"
+  if ! curl -fsSL --connect-timeout "${CHECK_TIMEOUT}" --max-time "${CHECK_TIMEOUT}" \
+    -o "${out}" "${base}/index.html"; then
+    VERIFY_ERROR="no se pudo consultar ${base}/index.html"
     return 1
   fi
   if [[ ! -s "${out}" ]]; then
-    VERIFY_ERROR="${base}/ respondió vacío"
+    VERIFY_ERROR="${base}/index.html respondió vacío"
     return 1
   fi
   out="${RUN_TMP}/check-manifest.json"
@@ -684,6 +697,15 @@ verify_served_release() { # <commit> -> 0 si el sitio sirve y responde ese commi
   got="$(manifest_field "${out}" commit 2>/dev/null)" || got=""
   if [[ "${got}" != "${commit}" ]]; then
     VERIFY_ERROR="${base}/MANIFEST.json sirve ${got:-nada} (esperado ${commit:0:7})"
+    return 1
+  fi
+  # El documento raíz servido tiene que ser byte a byte el del release activado.
+  if [[ ! -f "${WWW_DIR}/index.html" ]]; then
+    VERIFY_ERROR="el release activado no tiene ${WWW_DIR}/index.html"
+    return 1
+  fi
+  if ! cmp -s -- "${WWW_DIR}/index.html" "${RUN_TMP}/check-root.html"; then
+    VERIFY_ERROR="${base}/index.html no coincide con el documento del release activado"
     return 1
   fi
   return 0

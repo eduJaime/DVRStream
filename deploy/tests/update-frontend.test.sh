@@ -13,8 +13,10 @@
 # No requiere root ni red: el updater corre con --root en un sandbox y
 # --source-url file://…; las fallas de red y de permisos se inyectan stubbeando
 # curl, igual que install-lxc.test.sh stubbea chown/systemctl. La verificación
-# post-swap apunta a --check-url file://<sandbox>/opt/visor-camaras/www, que
-# curl resuelve localmente contra el symlink servido (sin red y sin stubs).
+# post-swap apunta a --check-url file://<sandbox>/opt/visor-camaras/www y pide
+# recursos concretos (index.html + MANIFEST.json), que curl resuelve localmente
+# contra el symlink servido (sin red y sin stubs, y sin depender del listado de
+# un directorio, que cambia según la versión de curl).
 #
 # Cubre:
 #   - CLI: uso, flags, contención del hook --source-url, --status sin estado
@@ -165,6 +167,17 @@ curl() {
     fi
     cp -- "${FIXTURE_MANIFEST}" "${out}"
     return 0
+  fi
+
+  # Documento raíz del check por defecto (http): el stub simula al go2rtc local
+  # sirviendo el index.html del release que www apunte en ese momento, así la
+  # comparación byte a byte contra el release activado es real.
+  if [[ "${url}" == "http://127.0.0.1:1984/index.html" ]]; then
+    if [[ -f "${SB_ROOT}/opt/visor-camaras/www/index.html" ]]; then
+      cp -- "${SB_ROOT}/opt/visor-camaras/www/index.html" "${out}"
+      return 0
+    fi
+    return 22
   fi
 
   case "${CURL_TARBALL_MODE}" in
@@ -563,6 +576,7 @@ MISSING="$( ( unset -f curl; PATH="${EMPTY_PATH}" missing_dependencies ) )"
 assert_contains "curl" "${MISSING}" 'curl'
 assert_contains "tar" "${MISSING}" 'tar'
 assert_contains "flock" "${MISSING}" 'flock'
+assert_contains "cmp" "${MISSING}" 'cmp'
 
 begin "missing_dependencies en este entorno -> vacío"
 assert_eq "sin faltantes" "" "$(missing_dependencies)"
@@ -643,6 +657,12 @@ assert_eq "sin ACTIVATION_PENDING tras activar" "" "$(state_get "${SB_ROOT}" ACT
 assert_eq "estado modo 0600" "600" "$(stat -c '%a' -- "${SB_ROOT}/var/lib/visor-camaras-update/state")"
 assert_eq "estado sin temporales" "" "$(find "${SB_ROOT}/var/lib/visor-camaras-update" -name '.state.*' -print -quit)"
 assert_clean_staging "staging limpio" "${SB_ROOT}"
+
+begin "check post-swap: recursos concretos (index.html), nunca el listado del directorio"
+assert_eq "el check raíz pide index.html" "1" \
+  "$(grep -cxF "file://${SB_ROOT}/opt/visor-camaras/www/index.html" "${CURL_ARGS_FILE}" || true)"
+assert_eq "no se consulta el directorio desnudo" "0" \
+  "$(grep -cxF "file://${SB_ROOT}/opt/visor-camaras/www/" "${CURL_ARGS_FILE}" || true)"
 
 begin "fetch test-only: file:// y sin forzado HTTPS"
 assert_not_contains "sin --proto en tests" "$(cat -- "${CURL_ARGS_FILE}")" '--proto'
@@ -752,6 +772,50 @@ assert_eq "commit fallado en cuarentena" "${NEW_COMMIT}" "$(state_get "${SB_ROOT
 assert_eq "www volvió a www.prev" "www.prev" "$(www_target "${SB_ROOT}")"
 assert_eq "sirve el commit anterior" "${SERVED_COMMIT}" "$(served_commit_in "${SB_ROOT}")"
 assert_eq "SERVED_COMMIT no cambió" "${SERVED_COMMIT}" "$(state_get "${SB_ROOT}" SERVED_COMMIT)"
+
+begin "check sin index.html servible -> NO se reporta success: rollback y cuarentena"
+prepare_sandbox "check-sin-index"
+prepare_published "${NEW_COMMIT}" "nuevo"
+CHECK_NO_INDEX="${WORK_DIR}/check-sin-index"
+make_check_fixture "${CHECK_NO_INDEX}" "${NEW_COMMIT}"
+rm -f -- "${CHECK_NO_INDEX}/index.html"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "file://${CHECK_NO_INDEX}"
+assert_eq "exit 1" "1" "${RC}"
+assert_eq "estado failed" "failed" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_contains "el diagnóstico nombra index.html" "$(state_get "${SB_ROOT}" LAST_ERROR)" 'index.html'
+assert_eq "commit fallado en cuarentena" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
+assert_eq "www volvió a www.prev" "www.prev" "$(www_target "${SB_ROOT}")"
+assert_eq "sirve el commit anterior" "${SERVED_COMMIT}" "$(served_commit_in "${SB_ROOT}")"
+assert_clean_staging "staging limpio" "${SB_ROOT}"
+
+begin "check con index.html vacío -> NO se reporta success: rollback y cuarentena"
+prepare_sandbox "check-index-vacio"
+prepare_published "${NEW_COMMIT}" "nuevo"
+CHECK_EMPTY_INDEX="${WORK_DIR}/check-index-vacio"
+make_check_fixture "${CHECK_EMPTY_INDEX}" "${NEW_COMMIT}"
+: > "${CHECK_EMPTY_INDEX}/index.html"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "file://${CHECK_EMPTY_INDEX}"
+assert_eq "exit 1" "1" "${RC}"
+assert_eq "estado failed" "failed" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_contains "diagnóstico de documento vacío" "$(state_get "${SB_ROOT}" LAST_ERROR)" 'vacío'
+assert_eq "commit fallado en cuarentena" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
+assert_eq "www volvió a www.prev" "www.prev" "$(www_target "${SB_ROOT}")"
+assert_eq "sirve el commit anterior" "${SERVED_COMMIT}" "$(served_commit_in "${SB_ROOT}")"
+
+begin "check con index.html distinto al del release activado -> NO success (identidad del documento)"
+prepare_sandbox "check-index-distinto"
+prepare_published "${NEW_COMMIT}" "nuevo"
+CHECK_OTHER_INDEX="${WORK_DIR}/check-index-distinto"
+make_check_fixture "${CHECK_OTHER_INDEX}" "${NEW_COMMIT}"
+printf '<!doctype html><html><body><app-root></app-root>OTRO SITIO</body></html>\n' \
+  > "${CHECK_OTHER_INDEX}/index.html"
+run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}" --check-url "file://${CHECK_OTHER_INDEX}"
+assert_eq "exit 1" "1" "${RC}"
+assert_eq "estado failed" "failed" "$(state_get "${SB_ROOT}" LAST_OUTCOME)"
+assert_contains "diagnóstico: documento distinto" "$(state_get "${SB_ROOT}" LAST_ERROR)" 'no coincide'
+assert_eq "commit fallado en cuarentena" "${NEW_COMMIT}" "$(state_get "${SB_ROOT}" QUARANTINED_COMMIT)"
+assert_eq "www volvió a www.prev" "www.prev" "$(www_target "${SB_ROOT}")"
+assert_eq "sirve el commit anterior" "${SERVED_COMMIT}" "$(served_commit_in "${SB_ROOT}")"
 
 begin "swap que aplica el release equivocado -> la verificación local lo detecta y hace rollback"
 prepare_sandbox "swap-equivocado"
@@ -919,7 +983,7 @@ prepare_published "${NEW_COMMIT}" "nuevo"
 : > "${CURL_ARGS_FILE}"
 run_update --root "${SB_ROOT}" --source-url "file://${PUB_DIR}"
 assert_eq "exit 0 (stub de curl responde el check)" "0" "${RC}"
-assert_eq "root por defecto" "1" "$(grep -cxF 'http://127.0.0.1:1984/' "${CURL_ARGS_FILE}" || true)"
+assert_eq "root por defecto" "1" "$(grep -cxF 'http://127.0.0.1:1984/index.html' "${CURL_ARGS_FILE}" || true)"
 assert_eq "manifest por defecto" "1" "$(grep -cxF 'http://127.0.0.1:1984/MANIFEST.json' "${CURL_ARGS_FILE}" || true)"
 
 printf '\n== sandbox: validación rechaza ==\n'
