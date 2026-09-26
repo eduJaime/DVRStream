@@ -1,0 +1,21 @@
+# Timer del updater del visor -- instalada por deploy/install-lxc.sh
+# Ruta final: /etc/systemd/system/visor-camaras-update.timer
+#
+# Cadencia documentada: primera corrida 5 minutos después del boot y luego cada
+# 30 minutos, con hasta 3 minutos de jitter y persistencia entre reinicios.
+#
+# Desactivación (procedimiento documentado del spec unattended-update):
+#   systemctl disable --now visor-camaras-update.timer
+# Reversión:
+#   systemctl enable --now visor-camaras-update.timer
+[Unit]
+Description=visor-camaras - actualizacion del frontend cada 30 minutos
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+RandomizedDelaySec=3min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,41 @@
+# Unidad systemd del updater del visor -- instalada por deploy/install-lxc.sh
+# Ruta final: /etc/systemd/system/visor-camaras-update.service
+#
+# Corre el updater una vez (oneshot) como el mismo usuario de go2rtc. Lo agenda
+# visor-camaras-update.timer cada 30 minutos. Para probarlo a mano:
+#   systemctl start visor-camaras-update.service
+#   journalctl -u visor-camaras-update.service -n 50 --no-pager
+[Unit]
+Description=visor-camaras - staging del frontend publicado (fetch y validacion)
+Documentation=https://github.com/eduJaime/DVRStream
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=go2rtc
+Group=go2rtc
+ExecStart=/usr/local/sbin/visor-camaras-update
+
+# Directorios gestionados por systemd con el usuario de la unidad:
+#   /var/lib/visor-camaras-update  estado (state)
+#   /var/cache/visor-camaras-update  cache
+#   /run/visor-camaras-update      flock del updater
+StateDirectory=visor-camaras-update
+CacheDirectory=visor-camaras-update
+RuntimeDirectory=visor-camaras-update
+TimeoutStartSec=15min
+
+# Endurecimiento (P-D20): superset de go2rtc.service. Acá no hay WebRTC, así
+# que ProtectSystem=strict es seguro. /opt/visor-camaras es lo único fuera de
+# los directorios de systemd que el updater escribe (staging y releases).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/visor-camaras
+ProtectHome=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryDenyWriteExecute=true
+UMask=0077
