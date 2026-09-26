@@ -1,7 +1,14 @@
 name: CI
 
-# PR1: la mitad de VERIFICACIÓN del pipeline. No publica nada, no usa
-# secretos y no pide permisos de escritura. El job de publicación llega en PR2.
+# Pipeline de publicación del frontend en dos mitades:
+#   verify  -- PR1: corre los gates reales sobre un Node fijo.
+#   publish -- PR2: publica en la rama frontend-dist EXACTAMENTE los bytes que
+#                    verify validó, y sólo en un push a main.
+# Fuerza de contención: el push existe únicamente en publish, su `if` admite
+# sólo push a refs/heads/main, el refspec es el literal HEAD:refs/heads/
+# frontend-dist y hay aserciones de ref y de rama antes de empujar. No hay
+# --all/--mirror ni ref derivado de entradas del evento.
+# Sin secretos: publish usa únicamente GITHUB_TOKEN con contents: write.
 
 on:
   push:
@@ -9,7 +16,8 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Mínimo privilegio: este workflow sólo lee el repositorio.
+# Mínimo privilegio a nivel workflow: sólo lectura. El permiso de escritura
+# vive únicamente en el job publish (P-D14).
 permissions:
   contents: read
 
@@ -43,12 +51,22 @@ jobs:
         working-directory: frontend
         # --watch=false está verificado localmente contra el builder
         # @angular/build:unit-test (sin TTY el default ya es false; explícito
-        # es a prueba de un runner con TTY).
+        # es a prueba de un runner con TTY). No cambiar por --no-watch.
         run: npx ng test --watch=false
 
       - name: Production build
         working-directory: frontend
         run: npx ng build --configuration production
+
+      # El manifiesto se escribe ANTES del gate de limpieza para que el gate
+      # revise exactamente los bytes que se publican (build + MANIFEST.json).
+      # El tree_sha256 sale del helper testeado deploy/manifest.sh.
+      - name: Write MANIFEST.json (tree hash)
+        run: |
+          bash deploy/manifest.sh write \
+            frontend/dist/frontend/browser \
+            "$GITHUB_SHA" "$GITHUB_RUN_ID" \
+            "$(node -v)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
       # Gate de limpieza: sin credenciales ni IPs privadas en lo publicable.
       - name: Artifact cleanliness gate
@@ -63,8 +81,131 @@ jobs:
       - name: Artifact gate harness
         run: bash deploy/tests/check-artifact.test.sh
 
+      - name: Manifest helper harness
+        run: bash deploy/tests/manifest.test.sh
+
+      - name: Workflow containment harness
+        run: bash deploy/tests/ci-workflow.test.sh
+
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
 
       - name: Shellcheck (warning severity)
         run: shellcheck --severity=warning deploy/*.sh deploy/tests/*.sh
+
+      # Los MISMOS bytes (build + manifiesto) viajan al job publish.
+      - name: Upload verified artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/frontend/browser
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish frontend-dist
+    needs: verify
+    # Sólo un push a main entra acá. Un PR (incluido el de un fork) nunca
+    # recibe contents: write ni puede alcanzar este job.
+    if: "github.event_name == 'push' && github.ref == 'refs/heads/main'"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # Único permiso de escritura del workflow (P-D14). Sin secretos ni PAT:
+    # empuja actions/checkout con el GITHUB_TOKEN del propio run.
+    permissions:
+      contents: write
+    # Serializa publicaciones: una nunca se cancela a mitad del push (P-D13).
+    concurrency:
+      group: frontend-dist-publish
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # El artefacto baja a RUNNER_TEMP, fuera del checkout: así la limpieza
+      # de la rama huérfana puede borrar TODO el árbol de trabajo sin perderlo.
+      - name: Download verified artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: ${{ runner.temp }}/frontend-dist
+
+      # Guarda 1: el evento y el ref son exactamente lo que el `if` afirmó.
+      - name: Assert event and ref
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_EVENT_NAME" = "push" ] || { echo "evento inesperado: $GITHUB_EVENT_NAME"; exit 1; }
+          [ "$GITHUB_REF" = "refs/heads/main" ] || { echo "ref inesperado: $GITHUB_REF"; exit 1; }
+
+      # Guarda 2: los bytes descargados coinciden con el tree_sha256 que verify
+      # escribió en el manifiesto. Un artefacto corrupto o alterado no se publica.
+      - name: Verify downloaded artifact integrity
+        run: bash deploy/manifest.sh check "$RUNNER_TEMP/frontend-dist"
+
+      # Construcción de un commit huérfano: la rama se reescribe entera en cada
+      # publish (P-D2). No se reconstruye nada: se copian los bytes descargados.
+      - name: Build frontend-dist commit (orphan, single commit)
+        env:
+          DIST_DIR: ${{ runner.temp }}/frontend-dist
+          HELPER: ${{ runner.temp }}/manifest.sh
+        run: |
+          set -euo pipefail
+          # La limpieza borra deploy/: el helper se guarda fuera del checkout
+          # para poder re-verificar la rama publicada más abajo.
+          cp deploy/manifest.sh "$HELPER"
+          git checkout --orphan frontend-dist
+          git rm -rf --quiet .
+          # Lo único que sobrevive es .git; después sólo entran los bytes bajados.
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a "$DIST_DIR/." .
+          git add -A
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "build: publish ${GITHUB_SHA:0:7} (run ${GITHUB_RUN_ID})"
+
+      # Guarda 3: la rama local es exactamente frontend-dist. El refspec del
+      # push es un literal; no hay --all, --mirror ni ref derivado de entradas.
+      - name: Assert branch before push
+        run: |
+          set -euo pipefail
+          branch="$(git rev-parse --abbrev-ref HEAD)"
+          [ "$branch" = "frontend-dist" ] || { echo "rama inesperada: $branch"; exit 1; }
+
+      - name: Force-push single commit
+        run: git push --force origin HEAD:refs/heads/frontend-dist
+
+      # P-D22: se re-descarga la rama desde codeload y se recalcula el hash.
+      # Prueba que la URL que usa el contenedor sirve exactamente lo verificado.
+      - name: Re-verify published branch via codeload
+        env:
+          BRANCH_TARBALL_URL: https://codeload.github.com/eduJaime/DVRStream/tar.gz/refs/heads/frontend-dist
+          HELPER: ${{ runner.temp }}/manifest.sh
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/published"
+          rm -rf "$out"; mkdir -p "$out"
+          for attempt in 1 2 3; do
+            if curl -fsSL --connect-timeout 10 --max-time 120 \
+                "$BRANCH_TARBALL_URL" -o "$RUNNER_TEMP/published.tar.gz"; then
+              break
+            fi
+            echo "descarga falló (intento $attempt de 3)"
+            if [ "$attempt" -lt 3 ]; then sleep 5; fi
+          done
+          [ -s "$RUNNER_TEMP/published.tar.gz" ] || {
+            echo "no se pudo descargar $BRANCH_TARBALL_URL"; exit 1;
+          }
+          tar -xzf "$RUNNER_TEMP/published.tar.gz" -C "$out" --strip-components=1
+          tree_sha="$(bash "$HELPER" check "$out")"
+          {
+            echo "### frontend-dist publicado"
+            echo ""
+            echo "| campo | valor |"
+            echo "|---|---|"
+            echo "| commit de la rama | \`$(git rev-parse HEAD)\` |"
+            echo "| commit de origen | \`$GITHUB_SHA\` |"
+            echo "| run | \`$GITHUB_RUN_ID\` |"
+            echo "| tree_sha256 | \`$tree_sha\` |"
+            echo ""
+            echo "Re-descargado desde codeload y verificado contra el manifiesto."
+          } >> "$GITHUB_STEP_SUMMARY"
