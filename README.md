@@ -35,6 +35,7 @@ Las credenciales RTSP viven **sólo** en `/etc/go2rtc/go2rtc.yaml` dentro del LX
 ```
 DVRStream/
 ├── README.md
+├── INSTALACION.md             tutorial paso a paso (LXC recién creado → visor)
 ├── PLAN-visor-camaras.md
 ├── VERIFICACION-MANUAL.md     checklist de hardware real (LXC + DVR)
 ├── .github/workflows/ci.yml   verify + publish del front
@@ -74,6 +75,10 @@ DVRStream/
 ---
 
 ## Puesta en marcha
+
+> **Tutorial paso a paso:** [`INSTALACION.md`](./INSTALACION.md) lleva un LXC recién
+> creado hasta el visor andando, con cada comando, qué deberías ver y qué hacer si
+> falla. Esta sección es el resumen.
 
 ### 1. Crear el LXC
 
@@ -214,10 +219,24 @@ quedó sólo como **muestra de referencia**: el script ya no lo copia.
 
 ### 3. Verificar go2rtc
 
-Abrir `http://IP_LXC:1984/` desde otra máquina de la LAN. El script deja el
-servicio activo y verificado; **antes** de publicar el front se ve la UI propia
-de go2rtc con las 4 cámaras. Si las 4 se ven ahí, el puente RTSP → WebRTC
-funciona.
+Ojo con esto, porque es contraintuitivo: el instalador configura `api.static_dir`,
+y eso **reemplaza la UI propia de go2rtc**. Hasta que el front se publique,
+`http://IP_LXC:1984/` devuelve un **listado de directorio vacío** — es lo
+esperado, **no un error**. No busques ahí las cámaras.
+
+Verificá el puente RTSP con la API y con un frame real:
+
+```bash
+systemctl is-active go2rtc                                        # active
+curl -s http://IP_LXC:1984/api/streams                            # los 4 streams
+curl -fsS -o /tmp/cam1.jpg 'http://IP_LXC:1984/api/frame.jpeg?src=cam1'
+ls -l /tmp/cam1.jpg                                               # JPEG > 0 bytes
+```
+
+Si `cam1.jpg` baja con contenido, el puente RTSP funciona y las credenciales del
+DVR están bien. Repetilo con `cam2`, `cam3` y `cam4`. Si baja vacío, el problema
+es el DVR o la red, **no el visor**: probá esa URL RTSP en VLC y revisá
+`journalctl -u go2rtc`.
 
 ### 4. Publicar el front
 
